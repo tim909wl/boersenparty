@@ -1,0 +1,64 @@
+/* Tailwind utilities only — preflight is intentionally skipped so this stylesheet (loaded
+   globally for the whole SPA bundle) can never interfere with display.css's hand-tuned,
+   TV-kiosk-safe layout on the /market route. */
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities);
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --radius: 0.75rem;
+  --radius-sm: calc(var(--radius) - 0.25rem);
+  --radius-md: calc(var(--radius) - 0.125rem);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 0.25rem);
+}
+
+:root{
+  /* Same palette as display.css, so the terminal UI and the TV display read as one product. */
+  --background:#0f1216;
+  --foreground:#f4f6f8;
+  --card:#161b21;
+  --card-foreground:#f4f6f8;
+  --popover:#161b21;
+  --popover-foreground:#f4f6f8;
+  --primary:#f2b84b;
+  --primary-foreground:#16120a;
+  --secondary:#1d232b;
+  --secondary-foreground:#f4f6f8;
+  --muted:#1d232b;
+  --muted-foreground:#8992a1;
+  --accent:#242932;
+  --accent-foreground:#f4f6f8;
+  --destructive:#ff5965;
+  --destructive-foreground:#ffffff;
+  --success:#3ddc84;
+  --success-foreground:#0f1216;
+  --border:#242932;
+  --input:#242932;
+  --ring:#f2b84b;
+}
+
+html,body{height:100%}
+body{font-family:var(--font-sans);-webkit-font-smoothing:antialiased}
+*{border-color:var(--color-border)}

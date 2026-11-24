@@ -35,5 +35,10 @@ export class Api{
   createUser(username:string,password:string,roles:string[]){return this.call<any>('/admin/users',{method:'POST',body:JSON.stringify({username,password,roles})})}
   setUserActive(id:string,active:boolean){return this.call<any>(`/admin/users/${id}/active`,{method:'PATCH',body:JSON.stringify({active})})}
   unlockUser(id:string){return this.call<any>(`/admin/users/${id}/unlock`,{method:'POST',body:'{}'})}
+  adminProducts(){return this.call<AdminProduct[]>('/admin/products')}
+  createProduct(input:ProductInput){return this.call<AdminProduct>('/admin/products',{method:'POST',body:JSON.stringify(input)})}
+  updateProduct(id:string,patch:Partial<ProductInput&{active:boolean}>){return this.call<AdminProduct>(`/admin/products/${id}`,{method:'PATCH',body:JSON.stringify(patch)})}
 }
 export type Product={id:string;name:string;category:string;priceCents:number;minPriceCents:number;maxPriceCents:number;version:number};export type MarketPoint={version:number;effectiveAt:number;prices:Record<string,number>};export type MarketHistory={points:MarketPoint[]};export type Quote={quoteId:string;totalCents:number;expiresAt:number};
+export type ProductInput={name:string;category:string;basePriceCents:number;minPriceCents:number;maxPriceCents:number};
+export type AdminProduct=ProductInput&{id:string;active:boolean;currentPriceCents:number|null};
