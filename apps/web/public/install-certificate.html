@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Einrichtung</title>
+<link rel="stylesheet" href="/install-certificate.css">
+</head>
+<body>
+<h1>Einmalige Einrichtung</h1>
+<p class="sub">Dieses Gerät kennt unser Zertifikat noch nicht. Für Kasse, Aufladung und NFC-Scan brauchen wir eine sichere (HTTPS-)Verbindung – das dauert einmalig knapp eine Minute.</p>
+
+<div class="step"><b class="n">1</b><div><b>Zertifikat herunterladen</b><br>Lade die Datei unten herunter.</div></div>
+<a class="btn download" href="/ca.pem" download="boersenparty-root-ca.pem">Zertifikat herunterladen</a>
+
+<div class="step"><b class="n">2</b><div><b>Auf dem Gerät installieren</b><br>
+Android: <i>Einstellungen → Sicherheit → Verschlüsselung &amp; Zugangsdaten → Zertifikat installieren → CA-Zertifikat</i>, dann die heruntergeladene Datei auswählen.<br>
+iPhone: <i>Einstellungen → Profil geladen → Installieren</i>, danach zusätzlich unter <i>Allgemein → Info → Zertifikatsvertrauenseinstellungen</i> aktivieren.</div></div>
+
+<div class="step"><b class="n">3</b><div><b>Weiter zur echten Seite</b><br>Danach hier weiter antippen – ab jetzt merkt sich das Gerät das.</div></div>
+<a class="btn continue" id="continueLink" href="#">Weiter (HTTPS)</a>
+
+<p class="note">Warum das nötig ist: Für Kartenlesen per NFC und ein paar andere Browser-Funktionen verlangen moderne Handys zwingend eine echte, verschlüsselte Verbindung. Da wir keine öffentliche Domain haben, nutzen wir ein eigenes, nur für dieses System gültiges Zertifikat – daher die einmalige Installation. Fernseher/Displays brauchen das nicht und laufen unverändert weiter.</p>
+
+<script src="/install-certificate.js"></script>
+</body>
+</html>

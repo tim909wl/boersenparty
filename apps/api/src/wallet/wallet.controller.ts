@@ -1,0 +1,2 @@
+import { Body,Controller,Post } from '@nestjs/common';import { z } from 'zod';import { Roles } from '../auth/auth.js';import { WalletService } from './wallet.service.js';
+@Controller('wallets') export class WalletController{constructor(private wallet:WalletService){} @Post('lookup') @Roles('BAR','TOPUP','PAYMENT_LEAD','ADMIN') lookup(@Body() b:unknown){return this.wallet.lookup(z.object({uid:z.string()}).parse(b).uid)}}

@@ -1,0 +1,3 @@
+import { Module } from '@nestjs/common';import { JwtModule } from '@nestjs/jwt';import { AuthController } from './auth.controller.js';import { AuthService } from './auth.service.js';import { AuthGuard } from './auth.js';import { UserAdminController } from './user-admin.controller.js';import { UserAdminService } from './user-admin.service.js';
+const jwtSecret=process.env.JWT_SECRET;if(!jwtSecret||jwtSecret.length<32)throw new Error('JWT_SECRET must contain at least 32 characters');
+@Module({imports:[JwtModule.register({global:true,secret:jwtSecret})],controllers:[AuthController,UserAdminController],providers:[AuthService,AuthGuard,UserAdminService],exports:[AuthGuard,UserAdminService]}) export class AuthModule{}

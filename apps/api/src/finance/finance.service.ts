@@ -1,0 +1,53 @@
+import { Injectable } from '@nestjs/common';
+import { DatabaseService } from '../database/database.service.js';
+import { canonicalHash, id } from '../common/hash.js';
+import { DomainError } from '../common/domain-error.js';
+import { WalletService } from '../wallet/wallet.service.js';
+import type { FundingMethod } from '@boersenparty/contracts';
+import { appendAudit } from '../common/audit.js';
+
+type Actor={sub:string;terminalId:string};
+@Injectable() export class FinanceService{
+  constructor(private db:DatabaseService,private wallets:WalletService){}
+  private replay(key:string,hash:string){const op=this.db.raw.prepare('SELECT request_hash,response_json,status FROM financial_operations WHERE idempotency_key=?').get(key) as any;if(!op)return; if(op.request_hash!==hash)throw new DomainError('IDEMPOTENCY_CONFLICT','Idempotency key was already used with a different request');if(op.status==='COMMITTED'&&op.response_json)return JSON.parse(op.response_json);throw new DomainError('OPERATION_INDETERMINATE','Existing operation has no committed response');}
+  private requirePayments(){const x=this.db.raw.prepare('SELECT mode FROM system_state WHERE id=1').get() as any;if(x?.mode==='PAYMENT_STOP')throw new DomainError('PAYMENT_STOP','Payments are stopped by operations',503);}
+  topup(input:{uid:string;amountCents:number;fundingMethod:FundingMethod;paymentReference?:string},key:string,actor:Actor){
+    const hash=canonicalHash(input), prior=this.replay(key,hash);if(prior)return prior;
+    if(!Number.isInteger(input.amountCents)||input.amountCents<100||input.amountCents>20000)throw new DomainError('INVALID_AMOUNT','Top-up must be between EUR 1 and EUR 200');
+    if(input.fundingMethod==='CARD_VERIFIED'&&!input.paymentReference)throw new DomainError('PAYMENT_REFERENCE_REQUIRED','Verified card top-ups require a provider reference');
+    return this.db.raw.transaction(()=>{this.requirePayments();const wallet=this.wallets.lookup(input.uid);if(wallet.status!=='ACTIVE')throw new DomainError('WALLET_UNAVAILABLE','Wallet is not active');
+      if(input.fundingMethod==='CARD_VERIFIED'&&this.db.raw.prepare("SELECT 1 FROM topups WHERE funding_method='CARD_VERIFIED' AND payment_reference=?").get(input.paymentReference))throw new DomainError('PAYMENT_REFERENCE_REUSED','This card payment reference was already credited');
+      const cashSession=input.fundingMethod==='CASH'?this.db.raw.prepare("SELECT id FROM cash_sessions WHERE terminal_id=? AND status='OPEN'").get(actor.terminalId) as any:null;if(input.fundingMethod==='CASH'&&!cashSession)throw new DomainError('CASH_SESSION_REQUIRED','Cash top-ups require an open cash session on this terminal',422);
+      const operationId=id(),now=Date.now(),account=this.db.raw.prepare("SELECT id FROM ledger_accounts WHERE wallet_id=? AND type='WALLET'").get(wallet.walletId) as any;
+      const clearing=this.db.raw.prepare("SELECT id FROM ledger_accounts WHERE type=? AND wallet_id IS NULL").get(input.fundingMethod==='CASH'?'CASH_CLEARING':'CARD_CLEARING') as any;
+      if(!account||!clearing)throw new DomainError('LEDGER_MISCONFIGURED','Required ledger account missing',500);
+      this.db.raw.prepare("INSERT INTO financial_operations VALUES(?,?,?,?, 'PENDING',?,?,?,?,NULL)").run(operationId,key,hash,'TOPUP',actor.terminalId,actor.sub,now,null);
+      this.db.raw.prepare('INSERT INTO ledger_entries VALUES(?,?,?,?,?)').run(id(),operationId,account.id,input.amountCents,now);
+      this.db.raw.prepare('INSERT INTO ledger_entries VALUES(?,?,?,?,?)').run(id(),operationId,clearing.id,-input.amountCents,now);
+      this.assertBalanced(operationId);this.db.raw.prepare('UPDATE wallets SET balance_cents=balance_cents+?,version=version+1 WHERE id=?').run(input.amountCents,wallet.walletId);
+      this.db.raw.prepare("INSERT INTO topups VALUES(?,?,?,?,?,?, 'COMMITTED',?)").run(id(),wallet.walletId,operationId,input.amountCents,input.fundingMethod,input.paymentReference??null,now);
+      if(cashSession)this.db.raw.prepare("INSERT INTO cash_session_operations VALUES(?,?,?,'TOPUP',?)").run(cashSession.id,operationId,input.amountCents,now);
+      const response={operationId,walletId:wallet.walletId,balanceCents:wallet.balanceCents+input.amountCents,amountCents:input.amountCents,status:'COMMITTED'};
+      this.db.raw.prepare("UPDATE financial_operations SET status='COMMITTED',committed_at=?,response_json=? WHERE id=?").run(now,JSON.stringify(response),operationId);appendAudit(this.db.raw,{actorId:actor.sub,action:'TOPUP_COMMITTED',entityType:'financial_operation',entityId:operationId,payload:{walletId:wallet.walletId,amountCents:input.amountCents,fundingMethod:input.fundingMethod,terminalId:actor.terminalId}});return response;
+    }).immediate();
+  }
+  purchase(input:{uid:string;quoteId:string},key:string,actor:Actor){
+    const hash=canonicalHash(input),prior=this.replay(key,hash);if(prior)return prior;
+    return this.db.raw.transaction(()=>{this.requirePayments();const wallet=this.wallets.lookup(input.uid);const q=this.db.raw.prepare("SELECT * FROM quotes WHERE id=? AND status='OPEN'").get(input.quoteId) as any;
+      if(!q||q.expires_at<Date.now())throw new DomainError('QUOTE_INVALID','Quote is missing, expired or already used');if(wallet.balanceCents<q.total_cents)throw new DomainError('INSUFFICIENT_FUNDS','Wallet balance is insufficient',422);
+      const now=Date.now(),operationId=id(),walletAccount=this.db.raw.prepare("SELECT id FROM ledger_accounts WHERE wallet_id=?").get(wallet.walletId) as any,sales=this.db.raw.prepare("SELECT id FROM ledger_accounts WHERE type='SALES'").get() as any;
+      this.db.raw.prepare("INSERT INTO financial_operations VALUES(?,?,?,?, 'PENDING',?,?,?,?,NULL)").run(operationId,key,hash,'PURCHASE',actor.terminalId,actor.sub,now,null);
+      this.db.raw.prepare('INSERT INTO ledger_entries VALUES(?,?,?,?,?)').run(id(),operationId,walletAccount.id,-q.total_cents,now);this.db.raw.prepare('INSERT INTO ledger_entries VALUES(?,?,?,?,?)').run(id(),operationId,sales.id,q.total_cents,now);this.assertBalanced(operationId);
+      const update=this.db.raw.prepare("UPDATE wallets SET balance_cents=balance_cents-?,version=version+1 WHERE id=? AND status='ACTIVE' AND balance_cents>=?").run(q.total_cents,wallet.walletId,q.total_cents);if(update.changes!==1)throw new DomainError('CONCURRENT_BALANCE_CHANGE','Balance changed; retry with a new quote');
+      this.db.raw.prepare("UPDATE quotes SET status='CONSUMED' WHERE id=?").run(q.id);const orderId=id();this.db.raw.prepare("INSERT INTO orders VALUES(?,?,?,?,?,?, 'PAID',?)").run(orderId,wallet.walletId,q.id,operationId,actor.terminalId,q.total_cents,now);
+      const response={operationId,orderId,walletId:wallet.walletId,totalCents:q.total_cents,balanceCents:wallet.balanceCents-q.total_cents,status:'COMMITTED'};this.db.raw.prepare("UPDATE financial_operations SET status='COMMITTED',committed_at=?,response_json=? WHERE id=?").run(now,JSON.stringify(response),operationId);appendAudit(this.db.raw,{actorId:actor.sub,action:'PURCHASE_COMMITTED',entityType:'order',entityId:orderId,payload:{operationId,walletId:wallet.walletId,totalCents:q.total_cents,terminalId:actor.terminalId}});return response;
+    }).immediate();
+  }
+  refund(input:{orderId:string;reason:string;amountCents?:number},key:string,actor:Actor){
+    const hash=canonicalHash(input),prior=this.replay(key,hash);if(prior)return prior;if(input.reason.trim().length<5)throw new DomainError('REASON_REQUIRED','Refund reason must contain at least 5 characters',400);if(input.amountCents!==undefined&&(!Number.isInteger(input.amountCents)||input.amountCents<=0))throw new DomainError('INVALID_REFUND_AMOUNT','Refund amount must be positive whole cents',400);
+    return this.db.raw.transaction(()=>{const order=this.db.raw.prepare("SELECT * FROM orders WHERE id=? AND status='PAID'").get(input.orderId) as any;if(!order)throw new DomainError('ORDER_NOT_REFUNDABLE','Order is missing or fully refunded',422);const refunded=(this.db.raw.prepare('SELECT COALESCE(SUM(amount_cents),0) amount FROM refunds WHERE original_order_id=?').get(order.id) as any).amount,remainingBefore=order.total_cents-refunded,amount=input.amountCents??remainingBefore;if(amount>remainingBefore)throw new DomainError('REFUND_EXCEEDS_REMAINING','Refund exceeds the remaining refundable amount',422);const now=Date.now(),operationId=id(),walletAccount=this.db.raw.prepare("SELECT id FROM ledger_accounts WHERE wallet_id=? AND type='WALLET'").get(order.wallet_id) as any,sales=this.db.raw.prepare("SELECT id FROM ledger_accounts WHERE type='SALES'").get() as any;if(!walletAccount||!sales)throw new DomainError('LEDGER_MISCONFIGURED','Required ledger account missing',500);
+      this.db.raw.prepare("INSERT INTO financial_operations VALUES(?,?,?,?, 'PENDING',?,?,?,?,NULL)").run(operationId,key,hash,'REFUND',actor.terminalId,actor.sub,now,null);this.db.raw.prepare('INSERT INTO ledger_entries VALUES(?,?,?,?,?)').run(id(),operationId,walletAccount.id,amount,now);this.db.raw.prepare('INSERT INTO ledger_entries VALUES(?,?,?,?,?)').run(id(),operationId,sales.id,-amount,now);this.assertBalanced(operationId);this.db.raw.prepare('UPDATE wallets SET balance_cents=balance_cents+?,version=version+1 WHERE id=?').run(amount,order.wallet_id);const remainingCents=remainingBefore-amount;if(remainingCents===0)this.db.raw.prepare("UPDATE orders SET status='REFUNDED' WHERE id=?").run(order.id);const refundId=id();this.db.raw.prepare('INSERT INTO refunds VALUES(?,?,?,?,?,?,?)').run(refundId,order.id,operationId,amount,input.reason.trim(),actor.sub,now);const wallet=this.db.raw.prepare('SELECT balance_cents balanceCents FROM wallets WHERE id=?').get(order.wallet_id) as any;const response={refundId,operationId,orderId:order.id,amountCents:amount,refundedTotalCents:refunded+amount,remainingCents,balanceCents:wallet.balanceCents,status:'COMMITTED'};this.db.raw.prepare("UPDATE financial_operations SET status='COMMITTED',committed_at=?,response_json=? WHERE id=?").run(now,JSON.stringify(response),operationId);appendAudit(this.db.raw,{actorId:actor.sub,action:remainingCents===0?'ORDER_REFUNDED':'ORDER_PARTIALLY_REFUNDED',entityType:'order',entityId:order.id,payload:{refundId,operationId,amountCents:amount,remainingCents,reason:input.reason.trim(),terminalId:actor.terminalId}});return response;
+    }).immediate();
+  }
+  assertBalanced(operationId:string){const x=this.db.raw.prepare('SELECT COALESCE(SUM(amount_cents),0) total,COUNT(*) count FROM ledger_entries WHERE operation_id=?').get(operationId) as any;if(x.total!==0||x.count<2)throw new DomainError('UNBALANCED_LEDGER','Operation does not balance',500);}
+}

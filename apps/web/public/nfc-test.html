@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Web-NFC-Test</title>
+<link rel="stylesheet" href="/nfc-test.css">
+</head>
+<body>
+<h1>Web-NFC-Test</h1>
+<p class="sub">Testet, was der Browser per Web NFC (<code>NDEFReader</code>) direkt von einem Armband auslesen kann – unabhängig von der Android-App.</p>
+
+<div class="card">
+  <div class="row"><b>Seite läuft über</b><span id="origin"></span></div>
+  <div class="row"><b>Sicherer Kontext (HTTPS/localhost)</b><span id="secure"></span></div>
+  <div class="row"><b>NDEFReader im Browser vorhanden</b><span id="support"></span></div>
+</div>
+
+<button id="scanBtn">Scan starten</button>
+<div id="status">Bereit.</div>
+
+<div class="scans" id="scans"></div>
+
+<script src="/nfc-test.js"></script>
+</body>
+</html>

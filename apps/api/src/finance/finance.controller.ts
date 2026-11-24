@@ -1,0 +1,5 @@
+import { Body,Controller,Headers,Post } from '@nestjs/common';import { z } from 'zod';import { CurrentPrincipal, Roles, type Principal } from '../auth/auth.js';import { FinanceService } from './finance.service.js';import { DomainError } from '../common/domain-error.js';
+const key=(v:string|undefined)=>{if(!v||v.length<8||v.length>128)throw new DomainError('IDEMPOTENCY_KEY_REQUIRED','Idempotency-Key header (8-128 characters) is required',400);return v};
+@Controller() export class FinanceController{constructor(private finance:FinanceService){}
+ @Post('topups') @Roles('TOPUP','PAYMENT_LEAD','ADMIN') topup(@Body() b:unknown,@Headers('idempotency-key') k:string|undefined,@CurrentPrincipal() p:Principal){const x=z.object({uid:z.string(),amountCents:z.number().int(),fundingMethod:z.enum(['CASH','CARD_VERIFIED']),paymentReference:z.string().min(1).optional()}).parse(b);return this.finance.topup(x,key(k),p)}
+ @Post('purchases') @Roles('BAR','ADMIN') purchase(@Body() b:unknown,@Headers('idempotency-key') k:string|undefined,@CurrentPrincipal() p:Principal){const x=z.object({uid:z.string(),quoteId:z.string().uuid()}).parse(b);return this.finance.purchase(x,key(k),p)}}

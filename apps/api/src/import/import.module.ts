@@ -1,0 +1,1 @@
+import { Module } from '@nestjs/common';import { WristbandImportService } from './wristband-import.service.js';@Module({providers:[WristbandImportService],exports:[WristbandImportService]})export class ImportModule{}

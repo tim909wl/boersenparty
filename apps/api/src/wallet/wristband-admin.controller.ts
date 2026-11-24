@@ -1,0 +1,2 @@
+import { Body,Controller,Post } from '@nestjs/common';import { z } from 'zod';import { CurrentPrincipal,Roles,type Principal } from '../auth/auth.js';import { WristbandAdminService } from './wristband-admin.service.js';
+@Controller('wristbands')export class WristbandAdminController{constructor(private admin:WristbandAdminService){}@Post('block')@Roles('PAYMENT_LEAD','ADMIN')block(@Body()b:unknown,@CurrentPrincipal()p:Principal){const x=z.object({uid:z.string(),reason:z.string().min(5).max(500)}).parse(b);return this.admin.block(x.uid,x.reason,p.sub)}}

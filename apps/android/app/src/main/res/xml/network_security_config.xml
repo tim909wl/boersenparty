@@ -1,0 +1,11 @@
+<network-security-config>
+  <!-- cleartext stays permitted for backward compatibility, but the terminal now targets HTTPS.
+       The trust-anchors let this app accept the local mkcert CA that staff install on the
+       phone for Web NFC in the browser, so the WebView trusts the same certificate. -->
+  <base-config cleartextTrafficPermitted="true">
+    <trust-anchors>
+      <certificates src="system"/>
+      <certificates src="user"/>
+    </trust-anchors>
+  </base-config>
+</network-security-config>

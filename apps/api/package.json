@@ -1,0 +1,41 @@
+{
+  "name": "@boersenparty/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsc -p tsconfig.json && concurrently -n tsc,run -c yellow,cyan \"tsc -p tsconfig.json --watch --preserveWatchOutput\" \"node --watch dist/main.js\"",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js",
+    "test": "vitest run src",
+    "db:migrate": "tsx src/cli/migrate.ts",
+    "db:seed": "tsx src/cli/seed.ts",
+    "import:wristbands": "tsx src/cli/import-wristbands.ts"
+  },
+  "dependencies": {
+    "@boersenparty/contracts": "*",
+    "@nestjs/common": "^11.1.9",
+    "@nestjs/core": "^11.1.9",
+    "@nestjs/jwt": "^11.0.1",
+    "@nestjs/platform-express": "^11.1.9",
+    "@nestjs/schedule": "^6.1.3",
+    "@nestjs/swagger": "^11.2.3",
+    "bcryptjs": "^3.0.3",
+    "better-sqlite3": "^12.4.1",
+    "drizzle-orm": "^0.45.4",
+    "helmet": "^8.1.0",
+    "read-excel-file": "^9.3.20",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2",
+    "zod": "^4.1.13"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^24.10.1",
+    "concurrently": "^9.1.2",
+    "supertest": "^7.1.4",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.14"
+  }
+}

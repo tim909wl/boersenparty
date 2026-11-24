@@ -1,0 +1,46 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    container_name: boersenparty-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_PATH: /app/data/boersenparty.db
+      BACKUP_DIR: /app/backups
+      PORT: "3000"
+      API_HOST: "0.0.0.0"
+    volumes:
+      - ./data:/app/data
+      - ./backups:/app/backups
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/v1/operations/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+
+  lan-proxy:
+    image: nginx:1.27-alpine
+    container_name: boersenparty-lan-proxy
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "80:8080"
+      - "8080:8080"
+      - "443:8443"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./deploy/locations.conf:/etc/nginx/includes/locations.conf:ro
+      - ./deploy/locations-http.conf:/etc/nginx/includes/locations-http.conf:ro
+      - ./deploy/api-proxy.conf:/etc/nginx/includes/api-proxy.conf:ro
+      - ./deploy/certs:/etc/nginx/certs:ro
+      - ./apps/web/dist:/usr/share/nginx/html:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/network-check | grep -q '\"proxy\":\"ok\"'"]
+      interval: 5s
+      timeout: 2s
+      retries: 5

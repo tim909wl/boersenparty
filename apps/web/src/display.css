@@ -1,0 +1,107 @@
+/* Getränkebörse – Preis-Display, angeglichen an den Getränkebörse-Live-Prototyp.
+   Layout bewusst in Flexbox statt CSS-Grid: ältere Smart-TV-Browser setzen Grid oft fehlerhaft um. */
+@font-face{font-family:"BX";src:url(/fonts/barlow-500.woff) format("woff");font-weight:500;font-display:swap}
+@font-face{font-family:"BX";src:url(/fonts/barlow-600.woff) format("woff");font-weight:600;font-display:swap}
+@font-face{font-family:"BX";src:url(/fonts/barlow-700.woff) format("woff");font-weight:700;font-display:swap}
+@font-face{font-family:"BXC";src:url(/fonts/barlow-sc-500.woff) format("woff");font-weight:500;font-display:swap}
+@font-face{font-family:"BXC";src:url(/fonts/barlow-sc-600.woff) format("woff");font-weight:600;font-display:swap}
+
+/* Kiosk guarantee: this is an unattended TV display and must never scroll, however content
+   or a future change might overflow — hard-locked at every level, not just the component root. */
+body:has(.public-display){margin:0;overflow:hidden;overscroll-behavior:none;touch-action:none}
+
+.public-display{
+  --bg:#0f1216;--line:#20262e;--fg:#f4f6f8;--muted:#8b95a3;--soft:#56606c;
+  --up:#3ddc84;--down:#ff5a5f;--gold:#f2b84b;
+  --display:"BX","Barlow","DejaVu Sans",Arial,sans-serif;
+  --body:"BXC","Barlow Semi Condensed","DejaVu Sans Condensed","Arial Narrow",sans-serif;
+  width:100vw;height:100dvh;max-width:none;margin:0;padding:var(--overscan);overflow:hidden;
+  background:var(--bg);color:var(--fg);font-family:var(--body);
+  font-size:calc(16px * var(--display-scale));
+  display:flex;flex-direction:column;
+  touch-action:none;overscroll-behavior:none;
+}
+.public-display *{box-sizing:border-box}
+
+.market-header{flex:none;min-height:8vh;padding:1em 2em;border-bottom:1px solid var(--line);background:var(--bg);display:flex;align-items:baseline;justify-content:space-between}
+.market-header h1{margin:0;font-family:var(--display);font-weight:700;font-size:2.15em;line-height:1;letter-spacing:-.01em}
+.market-header #clock{font-family:var(--display);font-weight:600;font-size:1.7em;color:var(--muted);font-variant-numeric:tabular-nums}
+
+.crashbar{flex:none;display:flex;align-items:baseline;justify-content:space-between;gap:1em;padding:.9em 2em;background:var(--down);color:#fff;font-family:var(--display);font-weight:700;font-size:1.15em}
+.crashbar span:last-child{font-variant-numeric:tabular-nums}
+
+.tape{flex:none;height:2.8em;display:flex;align-items:stretch;overflow:hidden;white-space:nowrap;border-bottom:1px solid var(--line);background:#0d1014;font:700 .8em/1 var(--display),Consolas,monospace}
+.tape div{flex:none;display:flex;align-items:center;gap:.8em;padding:0 1.2em;border-right:1px solid var(--line)}
+.tape b{font-weight:600}
+
+.category-board{flex:1 1 auto;min-height:0;padding:3.2vh 2em 2vh;display:flex;gap:4vw;overflow:hidden;background:var(--bg)}
+.market-column{flex:1 1 0;min-width:0;overflow:hidden;display:flex;flex-direction:column;gap:5vh}
+.market-category h2{margin:0;padding-bottom:.55em;border-bottom:1px solid var(--line);color:var(--muted);font-family:var(--display);font-size:1.55em;line-height:1;font-weight:600}
+.security-list{display:flex;flex-direction:column}
+
+.market-row{min-width:0;min-height:7.5vh;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:calc(var(--u,36px)*.18)}
+.market-row h3{flex:1 1 auto;min-width:0;margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600;font-size:1.65em;line-height:1}
+.mini-chart{flex:0 0 calc(var(--u,36px)*1.05);height:2.6em;min-width:0}
+.mini-chart canvas,.focus-chart canvas{display:block;width:100%;height:100%}
+.row-trend{flex:0 0 calc(var(--u,36px)*.82);text-align:right;font-family:var(--display);font-weight:600;font-size:1.1em;line-height:1;font-variant-numeric:tabular-nums;color:var(--soft);overflow:hidden}
+.row-trend.positive{color:var(--up)} .row-trend.negative{color:var(--down)}
+.market-row .price{flex:0 0 calc(var(--u,36px)*1.62);text-align:right;white-space:nowrap;line-height:1}
+.price{font-family:var(--display);font-weight:700;font-variant-numeric:tabular-nums;overflow:hidden;display:inline-block}
+.market-row .price{font-size:2.25em;letter-spacing:-.025em}
+.price .n{display:inline-block}
+.price .c{font-size:.5em;font-weight:500;color:var(--soft);margin-left:.15em}
+.price .n.ru{animation:ru .7s cubic-bezier(.2,.8,.2,1)} .price .n.rd{animation:rd .7s cubic-bezier(.2,.8,.2,1)}
+@keyframes ru{from{transform:translateY(90%);opacity:0}}
+@keyframes rd{from{transform:translateY(-90%);opacity:0}}
+
+.focus-card{margin-top:auto;min-height:28vh;display:flex;flex-direction:column}
+.focus-card>h2{margin:0;padding-bottom:.55em;border-bottom:1px solid var(--line);color:var(--muted);font-family:var(--display);font-size:1.55em;line-height:1;font-weight:600}
+.focus-card .inner{display:flex;flex-direction:column;gap:.35em;padding-top:1.4em;transition:opacity .5s,transform .5s}
+.focus-card.fade .inner{opacity:0;transform:translateY(1.2em)}
+.focus-card .k{font-family:var(--display);font-weight:600;font-size:1em;color:var(--gold)}
+.focus-card h3{margin:.1em 0 0;font-size:2em;line-height:1.1;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.focus-card .pr{display:flex;align-items:baseline;gap:.5em;margin-top:.1em}
+.focus-card .pr .price{font-size:4.5em;letter-spacing:-.03em}
+.focus-card .pr em{font-style:normal;font-size:1.05em;font-weight:600;color:var(--muted)}
+.focus-chart{min-height:6em;margin-top:.8em;border-top:1px dashed var(--line);padding-top:.6em}
+
+.empty-category{flex:1 1 auto;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:1.5em}
+
+.public-display footer{flex:none;min-height:3.2em;padding:.8em 2em;display:flex;justify-content:space-between;align-items:center;border-top:1px solid var(--line);color:var(--muted);background:var(--bg);font-size:.82em;font-weight:600}
+.public-display footer i{display:inline-block;width:.55em;height:.55em;margin-right:.5em;border-radius:50%;background:var(--up)}
+.public-display footer i.offline{background:var(--down)}
+
+.moment{position:fixed;inset:0;z-index:20;display:flex;flex-direction:column;justify-content:center;padding:0 7vw;background:var(--bg);color:var(--fg);opacity:0;visibility:hidden;transition:opacity .4s,visibility .4s}
+.moment.on{opacity:1;visibility:visible}
+.moment .k{font-family:var(--display);font-weight:600;font-size:clamp(18px,4.2vh,60px);color:var(--gold)}
+.moment .h{font-family:var(--display);font-weight:700;font-size:min(17vh,10vw);line-height:1.02;margin:1.5vh 0 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.moment .s{font-family:var(--display);font-weight:600;font-size:clamp(20px,6.5vh,96px);margin-top:2.5vh;font-variant-numeric:tabular-nums;color:var(--muted)}
+.moment.up .s{color:var(--up)} .moment.down .s{color:var(--down)}
+.moment.crash{background:var(--down);color:#fff}
+.moment.crash .k{color:rgba(255,255,255,.75)}
+.moment.crash .s{color:rgba(255,255,255,.85)}
+.moment.on .k{animation:mup .6s .05s cubic-bezier(.2,.8,.2,1) both}
+.moment.on .h{animation:mup .7s .15s cubic-bezier(.2,.8,.2,1) both}
+.moment.on .s{animation:mup .7s .3s cubic-bezier(.2,.8,.2,1) both}
+@keyframes mup{from{transform:translateY(5vh);opacity:0}}
+@media(prefers-reduced-motion:reduce){.price .n.ru,.price .n.rd,.moment.on .k,.moment.on .h,.moment.on .s{animation:none}}
+
+.format-21x9 .category-board{padding-top:2vh}
+.format-21x9 .market-column{gap:3vh}
+.format-21x9 .market-row{min-height:6.5vh}
+.format-4x3{font-size:calc(13px * var(--display-scale))}
+.format-4x3 .category-board{gap:2.5vw;padding-left:1.4em;padding-right:1.4em}
+.format-9x16{font-size:calc(14px * var(--display-scale))}
+.format-9x16 .category-board{flex-direction:column}
+.format-9x16 .market-row{min-height:5.5em}
+@media(max-width:900px){
+  .category-board{gap:2vw}
+  .market-row h3{font-size:1.35em}
+  .market-row .price{font-size:1.9em}
+}
+@media(max-width:620px){
+  .market-header h1{font-size:1.55em}
+  .market-header #clock{font-size:1.2em}
+  .category-board{flex-direction:column}
+  .market-row{min-height:5.5em}
+}
