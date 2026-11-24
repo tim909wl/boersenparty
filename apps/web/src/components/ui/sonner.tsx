@@ -6,7 +6,7 @@ type ToasterProps = ComponentProps<typeof Sonner>;
 function Toaster(props: ToasterProps) {
   return (
     <Sonner
-      theme="dark"
+      theme="light"
       className="toaster group"
       style={{
         // Sonner's own CSS variables for the default ("normal") toast — belt-and-suspenders

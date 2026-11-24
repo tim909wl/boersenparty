@@ -35,28 +35,30 @@
 }
 
 :root{
-  /* Same palette as display.css, so the terminal UI and the TV display read as one product. */
-  --background:#0f1216;
-  --foreground:#f4f6f8;
-  --card:#161b21;
-  --card-foreground:#f4f6f8;
-  --popover:#161b21;
-  --popover-foreground:#f4f6f8;
-  --primary:#f2b84b;
+  /* Light mode for the whole terminal app (staff-facing, used in a bright setting) — only the
+     /market TV display stays dark, via its own separate display.css palette. The gold accent is
+     kept so it still reads as the same product. */
+  --background:#f7f7f8;
+  --foreground:#16181c;
+  --card:#ffffff;
+  --card-foreground:#16181c;
+  --popover:#ffffff;
+  --popover-foreground:#16181c;
+  --primary:#e2a62e;
   --primary-foreground:#16120a;
-  --secondary:#1d232b;
-  --secondary-foreground:#f4f6f8;
-  --muted:#1d232b;
-  --muted-foreground:#8992a1;
-  --accent:#242932;
-  --accent-foreground:#f4f6f8;
-  --destructive:#ff5965;
+  --secondary:#eef0f3;
+  --secondary-foreground:#16181c;
+  --muted:#eef0f3;
+  --muted-foreground:#676d76;
+  --accent:#eef0f3;
+  --accent-foreground:#16181c;
+  --destructive:#dc2626;
   --destructive-foreground:#ffffff;
-  --success:#3ddc84;
-  --success-foreground:#0f1216;
-  --border:#242932;
-  --input:#242932;
-  --ring:#f2b84b;
+  --success:#15803d;
+  --success-foreground:#ffffff;
+  --border:#e1e3e8;
+  --input:#e1e3e8;
+  --ring:#e2a62e;
 }
 
 html,body{height:100%}

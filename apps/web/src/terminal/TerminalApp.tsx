@@ -189,6 +189,27 @@ export default function TerminalApp() {
   );
 }
 
+const CUSTOM_REASON = '__custom__';
+// A dropdown of standard reasons plus a "custom" escape hatch — picking any preset fills the
+// field instantly (no typing) for the fast, repetitive decisions staff make all night; typing
+// something else switches the field to free text automatically.
+function ReasonPicker({ label, value, onChange, presets }: { label: string; value: string; onChange: (v: string) => void; presets: string[] }) {
+  const isPreset = presets.includes(value);
+  return (
+    <div className="flex flex-col gap-1.5">
+      <Label>{label}</Label>
+      <Select value={isPreset ? value : CUSTOM_REASON} onValueChange={v => onChange(v === CUSTOM_REASON ? '' : v)}>
+        <SelectTrigger><SelectValue /></SelectTrigger>
+        <SelectContent>
+          {presets.map(p => <SelectItem key={p} value={p}>{p}</SelectItem>)}
+          <SelectItem value={CUSTOM_REASON}>Eigener Text…</SelectItem>
+        </SelectContent>
+      </Select>
+      {!isPreset && <Input value={value} onChange={e => onChange(e.target.value)} placeholder="Grund eingeben" autoFocus />}
+    </div>
+  );
+}
+
 function UidScanner({ uid, setUid }: { uid: string; setUid: (x: string) => void }) {
   return (
     <div className="flex flex-col gap-2">
@@ -265,7 +286,7 @@ function PosView({ uid, setUid, products, cart, setCart, onPay, disabled }: {
           <button key={p.id} disabled={p.soldOut} onClick={() => setCart(c => ({ ...c, [p.id]: (c[p.id] ?? 0) + 1 }))}
             className="relative flex flex-col items-start gap-1 rounded-xl border border-border bg-card p-4 text-left transition-transform active:scale-95 hover:border-primary/50 disabled:opacity-40 disabled:active:scale-100 disabled:hover:border-border">
             {Boolean(cart[p.id]) && <span className="absolute -top-2 -right-2 flex h-6 w-6 items-center justify-center rounded-full bg-primary text-xs font-bold text-primary-foreground">{cart[p.id]}</span>}
-            <span className="font-semibold leading-tight">{p.name}</span>
+            <span className="font-semibold leading-tight line-clamp-2 break-words">{p.name}</span>
             {p.soldOut ? <span className="text-muted-foreground font-bold text-sm">ausverkauft</span> : <span className="text-primary font-bold">{euro(p.priceCents)}</span>}
           </button>
         ))}
@@ -314,9 +335,9 @@ function MarketView({ products }: { products: Product[] }) {
           <h3 className="text-sm font-semibold text-muted-foreground mb-2">{category}</h3>
           <div className="flex flex-col gap-1">
             {items.map(p => (
-              <div key={p.id} className="flex items-center justify-between rounded-lg px-3 py-2.5 bg-card border border-border">
-                <span className="font-medium">{p.name}</span>
-                <span className="font-bold text-primary">{euro(p.priceCents)}</span>
+              <div key={p.id} className="flex items-center justify-between gap-3 rounded-lg px-3 py-2.5 bg-card border border-border">
+                <span className="font-medium truncate min-w-0">{p.name}</span>
+                <span className="font-bold text-primary shrink-0">{euro(p.priceCents)}</span>
               </div>
             ))}
           </div>
@@ -475,7 +496,15 @@ function CrashPanel({ api }: { api: Api }) {
       <CardHeader><CardTitle>Börsencrash</CardTitle><CardDescription>Alle Preise für ein paar Minuten auf Tiefstpreis – das Display kündigt es groß an.</CardDescription></CardHeader>
       <CardContent>
         {crashing && <Badge variant="destructive">{health.state.crashKind === 'AUSVERKAUF' ? 'Ausverkauf' : 'Crash'} läuft noch bis {new Date(crashUntil).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })}</Badge>}
-        <div className="flex flex-col gap-1.5"><Label>Minuten</Label><Input inputMode="numeric" value={minutes} onChange={e => setMinutes(e.target.value)} /></div>
+        <div className="flex flex-col gap-1.5">
+          <Label>Minuten</Label>
+          <Input inputMode="numeric" value={minutes} onChange={e => setMinutes(e.target.value)} />
+          <div className="flex gap-1.5 flex-wrap">
+            {[2, 3, 5, 10, 15, 20].map(n => (
+              <Button key={n} type="button" size="sm" variant={minutes === String(n) ? 'default' : 'outline'} onClick={() => setMinutes(String(n))}>{n}′</Button>
+            ))}
+          </div>
+        </div>
         <div className="grid grid-cols-2 gap-2">
           <Button variant="destructive" disabled={crashing} onClick={() => action(() => api.startCrash(Math.max(1, Math.min(30, Number(minutes) || 5)), 'CRASH'), 'Crash gestartet')}>Crash auslösen</Button>
           <Button variant="secondary" disabled={crashing} onClick={() => action(() => api.startCrash(Math.max(1, Math.min(30, Number(minutes) || 20)), 'AUSVERKAUF'), 'Ausverkauf gestartet')}>Ausverkauf starten</Button>
@@ -502,19 +531,19 @@ function ApprovalPanel({ api }: { api: Api }) {
       <Card>
         <CardHeader><CardTitle className="flex items-center gap-2"><Lock className="h-4 w-4" />Neuen Antrag stellen</CardTitle></CardHeader>
         <CardContent>
-          <div className="flex flex-col gap-1.5"><Label>NORMAL-Begründung</Label><Input value={normalReason} onChange={e => setNormalReason(e.target.value)} /></div>
+          <ReasonPicker label="NORMAL-Begründung" value={normalReason} onChange={setNormalReason} presets={['Vor-Ort-Prüfung erfolgreich', 'Kassensturz abgeschlossen', 'Testphase beendet']} />
           <Button size="sm" variant="outline" onClick={() => action(() => api.requestNormalMode(normalReason), 'NORMAL-Freigabe beantragt')}>NORMAL beantragen</Button>
           <Separator />
           <div className="grid grid-cols-2 gap-2">
             <div className="flex flex-col gap-1.5"><Label>Alte UID</Label><Input value={oldUid} onChange={e => setOldUid(e.target.value)} /></div>
             <div className="flex flex-col gap-1.5"><Label>Ersatz-UID</Label><Input value={newUid} onChange={e => setNewUid(e.target.value)} /></div>
           </div>
-          <div className="flex flex-col gap-1.5"><Label>Wechselgrund</Label><Input value={bandReason} onChange={e => setBandReason(e.target.value)} /></div>
+          <ReasonPicker label="Wechselgrund" value={bandReason} onChange={setBandReason} presets={['Armband verloren', 'Armband defekt', 'Akku/Chip beschädigt', 'Falsch zugewiesen']} />
           <Button size="sm" variant="outline" onClick={() => action(() => api.requestBandReplacement(oldUid, newUid, bandReason), 'Armbandwechsel beantragt')}>Armbandwechsel beantragen</Button>
           <Separator />
           <div className="flex flex-col gap-1.5"><Label>Bestell-ID</Label><Input value={orderId} onChange={e => setOrderId(e.target.value)} /></div>
           <div className="flex flex-col gap-1.5"><Label>Stornobetrag in € (leer = kompletter Rest)</Label><Input inputMode="decimal" value={refundAmount} onChange={e => setRefundAmount(e.target.value)} /></div>
-          <div className="flex flex-col gap-1.5"><Label>Stornogrund</Label><Input value={refundReason} onChange={e => setRefundReason(e.target.value)} /></div>
+          <ReasonPicker label="Stornogrund" value={refundReason} onChange={setRefundReason} presets={['Fehlbuchung bestätigt', 'Falsches Getränk kassiert', 'Kunde storniert', 'Doppelte Buchung']} />
           <Button size="sm" variant="outline" onClick={() => action(() => api.requestRefund(orderId, refundReason, refundAmount ? toCents(refundAmount) : undefined), 'Storno beantragt')}>Storno beantragen</Button>
         </CardContent>
       </Card>
@@ -523,7 +552,7 @@ function ApprovalPanel({ api }: { api: Api }) {
         <Card>
           <CardHeader><CardTitle>Offene Anträge ({pending.length})</CardTitle></CardHeader>
           <CardContent>
-            <div className="flex flex-col gap-1.5"><Label>Ablehnungsgrund</Label><Input value={rejectReason} onChange={e => setRejectReason(e.target.value)} /></div>
+            <ReasonPicker label="Ablehnungsgrund" value={rejectReason} onChange={setRejectReason} presets={['Antrag nicht freigegeben', 'Nicht plausibel', 'Rücksprache nötig']} />
             {pending.map(x => (
               <div key={x.id} className="rounded-lg border border-border p-3 flex flex-col gap-2">
                 <p className="font-semibold text-sm">{x.type}</p>
