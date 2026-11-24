@@ -20,27 +20,27 @@ function validateRange(x: ProductInput) {
 
   list() {
     return this.db.raw.prepare(`
-      SELECT p.id,p.name,p.category,p.base_price_cents basePriceCents,p.min_price_cents minPriceCents,p.max_price_cents maxPriceCents,p.active,pe.price_cents currentPriceCents
+      SELECT p.id,p.name,p.category,p.base_price_cents basePriceCents,p.min_price_cents minPriceCents,p.max_price_cents maxPriceCents,p.active,p.sold_out soldOut,pe.price_cents currentPriceCents
       FROM products p LEFT JOIN price_entries pe ON pe.product_id=p.id AND pe.price_version_id=(SELECT id FROM price_versions WHERE status='ACTIVE')
       ORDER BY p.category,p.name
-    `).all().map((x: any) => ({ ...x, active: Boolean(x.active) }));
+    `).all().map((x: any) => ({ ...x, active: Boolean(x.active), soldOut: Boolean(x.soldOut) }));
   }
 
   create(input: ProductInput, actorId: string) {
     validateRange(input);
     return this.db.raw.transaction(() => {
       const productId = id();
-      this.db.raw.prepare('INSERT INTO products VALUES(?,?,?,?,?,?,1)').run(productId, input.name.trim(), input.category.trim(), input.basePriceCents, input.minPriceCents, input.maxPriceCents);
+      this.db.raw.prepare('INSERT INTO products VALUES(?,?,?,?,?,?,1,0)').run(productId, input.name.trim(), input.category.trim(), input.basePriceCents, input.minPriceCents, input.maxPriceCents);
       const active = this.db.raw.prepare("SELECT id FROM price_versions WHERE status='ACTIVE'").get() as any;
       if (active) this.db.raw.prepare('INSERT INTO price_entries VALUES(?,?,?)').run(active.id, productId, input.basePriceCents);
       appendAudit(this.db.raw, { actorId, action: 'PRODUCT_CREATED', entityType: 'product', entityId: productId, payload: input });
-      return { id: productId, ...input, active: true };
+      return { id: productId, ...input, active: true, soldOut: false };
     }).immediate();
   }
 
-  update(productId: string, patch: Partial<ProductInput & { active: boolean }>, actorId: string) {
+  update(productId: string, patch: Partial<ProductInput & { active: boolean; soldOut: boolean }>, actorId: string) {
     return this.db.raw.transaction(() => {
-      const current = this.db.raw.prepare('SELECT id,name,category,base_price_cents basePriceCents,min_price_cents minPriceCents,max_price_cents maxPriceCents,active FROM products WHERE id=?').get(productId) as any;
+      const current = this.db.raw.prepare('SELECT id,name,category,base_price_cents basePriceCents,min_price_cents minPriceCents,max_price_cents maxPriceCents,active,sold_out soldOut FROM products WHERE id=?').get(productId) as any;
       if (!current) throw new DomainError('PRODUCT_NOT_FOUND', 'Product not found', 404);
       const merged: ProductInput = {
         name: patch.name ?? current.name, category: patch.category ?? current.category,
@@ -48,8 +48,9 @@ function validateRange(x: ProductInput) {
       };
       validateRange(merged);
       const active = patch.active ?? Boolean(current.active);
-      this.db.raw.prepare('UPDATE products SET name=?,category=?,base_price_cents=?,min_price_cents=?,max_price_cents=?,active=? WHERE id=?')
-        .run(merged.name.trim(), merged.category.trim(), merged.basePriceCents, merged.minPriceCents, merged.maxPriceCents, active ? 1 : 0, productId);
+      const soldOut = patch.soldOut ?? Boolean(current.soldOut);
+      this.db.raw.prepare('UPDATE products SET name=?,category=?,base_price_cents=?,min_price_cents=?,max_price_cents=?,active=?,sold_out=? WHERE id=?')
+        .run(merged.name.trim(), merged.category.trim(), merged.basePriceCents, merged.minPriceCents, merged.maxPriceCents, active ? 1 : 0, soldOut ? 1 : 0, productId);
       // Keep the live price inside the (possibly narrowed) range rather than waiting for the next tick.
       const activeVersion = this.db.raw.prepare("SELECT id FROM price_versions WHERE status='ACTIVE'").get() as any;
       if (activeVersion) {
@@ -61,8 +62,8 @@ function validateRange(x: ProductInput) {
           this.db.raw.prepare('INSERT INTO price_entries VALUES(?,?,?)').run(activeVersion.id, productId, merged.basePriceCents);
         }
       }
-      appendAudit(this.db.raw, { actorId, action: 'PRODUCT_UPDATED', entityType: 'product', entityId: productId, payload: { ...merged, active } });
-      return { id: productId, ...merged, active };
+      appendAudit(this.db.raw, { actorId, action: 'PRODUCT_UPDATED', entityType: 'product', entityId: productId, payload: { ...merged, active, soldOut } });
+      return { id: productId, ...merged, active, soldOut };
     }).immediate();
   }
 }

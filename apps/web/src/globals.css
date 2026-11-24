@@ -62,3 +62,12 @@
 html,body{height:100%}
 body{font-family:var(--font-sans);-webkit-font-smoothing:antialiased}
 *{border-color:var(--color-border)}
+
+/* The terminal app (not /market, which has no native form controls at all) uses raw <button>/
+   <input>/<select> elements styled purely with Tailwind utilities. Without Preflight (skipped
+   above so it can never touch display.css), the browser's own UA chrome — a light button
+   background on macOS/iOS in particular — was showing through. Scoped here instead of a global
+   reset so it stays provably safe for the display. */
+button,input,select,textarea{appearance:none;-webkit-appearance:none;background:transparent;border:0;font:inherit;color:inherit}
+button{cursor:pointer}
+button:disabled{cursor:not-allowed}

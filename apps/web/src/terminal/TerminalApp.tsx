@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import {
-  Beer, CreditCard, Landmark, LineChart, Lock, LogOut, Nfc, Plus, Settings2, ShieldCheck, Unlock, Users, Wallet,
+  Beer, ChevronLeft, ChevronRight, CreditCard, Landmark, LineChart, Lock, LogOut, Nfc, Plus, Settings2, ShieldCheck, Unlock, Users, Wallet,
 } from 'lucide-react';
 import { Api, type AdminProduct, type Product, uuid } from '@/api';
 import { Button } from '@/components/ui/button';
@@ -42,7 +42,9 @@ export default function TerminalApp() {
   const [health, setHealth] = useState<any>();
   const [pending, setPending] = useState<PendingOperation | null>(loadPending);
   const [nfcActive, setNfcActive] = useState(false);
+  const [collapsed, setCollapsed] = useState(() => localStorage.getItem('sidebar-collapsed') === '1');
   const submittingRef = useRef(false);
+  function toggleCollapsed() { setCollapsed(c => { localStorage.setItem('sidebar-collapsed', c ? '0' : '1'); return !c }) }
 
   useEffect(() => {
     window.onNfcUid = (x) => { setUid(x); toast.info(`Armband gelesen: ${x}`) };
@@ -118,20 +120,28 @@ export default function TerminalApp() {
     <div className="min-h-dvh bg-background text-foreground flex flex-col sm:flex-row">
       <Toaster position="top-center" richColors closeButton />
       {/* Sidebar on tablet/desktop */}
-      <aside className="hidden sm:flex sm:w-56 sm:flex-col sm:border-r sm:border-border sm:p-4 sm:gap-1">
-        <div className="px-2 pb-4">
-          <p className="font-bold text-lg">Börsenparty</p>
-          <Badge variant={connected ? 'success' : 'destructive'} className="mt-2">{mode}</Badge>
+      <aside className={`hidden sm:flex sm:flex-col sm:border-r sm:border-border sm:p-3 sm:gap-1 transition-[width] shrink-0 ${collapsed ? 'sm:w-[4.5rem]' : 'sm:w-56'}`}>
+        <div className={`flex items-center px-1 pb-4 ${collapsed ? 'justify-center' : 'justify-between'}`}>
+          {!collapsed && (
+            <div>
+              <p className="font-bold text-lg">Börsenparty</p>
+              <Badge variant={connected ? 'success' : 'destructive'} className="mt-2">{mode}</Badge>
+            </div>
+          )}
+          <Button variant="ghost" size="icon" className="h-8 w-8 shrink-0" onClick={toggleCollapsed} title={collapsed ? 'Seitenleiste ausklappen' : 'Seitenleiste einklappen'}>
+            {collapsed ? <ChevronRight className="h-4 w-4" /> : <ChevronLeft className="h-4 w-4" />}
+          </Button>
         </div>
+        {collapsed && <Badge variant={connected ? 'success' : 'destructive'} className="mx-auto mb-2 px-1.5 text-[10px]">{connected ? 'OK' : '!'}</Badge>}
         {NAV.map(n => (
-          <button key={n.id} onClick={() => setView(n.id)}
-            className={`flex items-center gap-3 rounded-md px-3 py-2.5 text-sm font-medium transition-colors ${view === n.id ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:bg-accent hover:text-foreground'}`}>
-            <n.icon className="h-4 w-4" /> {n.label}
+          <button key={n.id} onClick={() => setView(n.id)} title={n.label}
+            className={`flex items-center gap-3 rounded-md px-3 py-2.5 text-sm font-medium transition-colors ${collapsed ? 'justify-center' : ''} ${view === n.id ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:bg-accent hover:text-foreground'}`}>
+            <n.icon className="h-4 w-4 shrink-0" /> {!collapsed && n.label}
           </button>
         ))}
         <div className="mt-auto flex flex-col gap-2 pt-4">
-          {nfcSupported && <Button variant={nfcActive ? 'success' : 'outline'} size="sm" onClick={startNfc} disabled={nfcActive}><Nfc className="h-4 w-4" />{nfcActive ? 'NFC aktiv' : 'NFC aktivieren'}</Button>}
-          <Button variant="ghost" size="sm" onClick={() => { api.setToken(''); location.reload() }}><LogOut className="h-4 w-4" />Abmelden</Button>
+          {nfcSupported && <Button variant={nfcActive ? 'success' : 'outline'} size="sm" onClick={startNfc} disabled={nfcActive} title="NFC aktivieren" className={collapsed ? 'px-0' : ''}><Nfc className="h-4 w-4 shrink-0" />{!collapsed && (nfcActive ? 'NFC aktiv' : 'NFC aktivieren')}</Button>}
+          <Button variant="ghost" size="sm" onClick={() => { api.setToken(''); location.reload() }} title="Abmelden" className={collapsed ? 'px-0' : ''}><LogOut className="h-4 w-4 shrink-0" />{!collapsed && 'Abmelden'}</Button>
         </div>
       </aside>
 
@@ -147,9 +157,15 @@ export default function TerminalApp() {
       <main className="flex-1 overflow-y-auto p-4 pb-24 sm:pb-4 sm:p-6 max-w-3xl w-full mx-auto">
         {pending && (
           <Card className="mb-4 border-primary/50">
-            <CardContent className="flex items-center justify-between py-4">
-              <p className="text-sm">Ungeklärter Vorgang vom letzten Versuch.</p>
-              <Button size="sm" onClick={() => execute(pending)}>Erneut prüfen</Button>
+            <CardContent className="flex items-center justify-between py-4 gap-3">
+              <div>
+                <p className="text-sm font-medium">Ungeklärter Vorgang vom letzten Versuch</p>
+                <p className="text-xs text-muted-foreground">{pending.type === 'purchase' ? 'Zahlung' : 'Aufladung'} · Armband {pending.uid}</p>
+              </div>
+              <div className="flex gap-2 shrink-0">
+                <Button size="sm" variant="outline" onClick={() => { remember(null); toast.info('Verworfen – neuen Versuch starten.') }}>Verwerfen</Button>
+                <Button size="sm" onClick={() => execute(pending)}>Erneut prüfen</Button>
+              </div>
             </CardContent>
           </Card>
         )}
@@ -246,11 +262,11 @@ function PosView({ uid, setUid, products, cart, setCart, onPay, disabled }: {
       <UidScanner uid={uid} setUid={setUid} />
       <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
         {products.map(p => (
-          <button key={p.id} onClick={() => setCart(c => ({ ...c, [p.id]: (c[p.id] ?? 0) + 1 }))}
-            className="relative flex flex-col items-start gap-1 rounded-xl border border-border bg-card p-4 text-left transition-transform active:scale-95 hover:border-primary/50">
+          <button key={p.id} disabled={p.soldOut} onClick={() => setCart(c => ({ ...c, [p.id]: (c[p.id] ?? 0) + 1 }))}
+            className="relative flex flex-col items-start gap-1 rounded-xl border border-border bg-card p-4 text-left transition-transform active:scale-95 hover:border-primary/50 disabled:opacity-40 disabled:active:scale-100 disabled:hover:border-border">
             {Boolean(cart[p.id]) && <span className="absolute -top-2 -right-2 flex h-6 w-6 items-center justify-center rounded-full bg-primary text-xs font-bold text-primary-foreground">{cart[p.id]}</span>}
             <span className="font-semibold leading-tight">{p.name}</span>
-            <span className="text-primary font-bold">{euro(p.priceCents)}</span>
+            {p.soldOut ? <span className="text-muted-foreground font-bold text-sm">ausverkauft</span> : <span className="text-primary font-bold">{euro(p.priceCents)}</span>}
           </button>
         ))}
       </div>
@@ -328,13 +344,19 @@ function ProductsView({ api }: { api: Api }) {
       </div>
       <div className="flex flex-col gap-2">
         {products.map(p => (
-          <button key={p.id} onClick={() => openEdit(p)} className="flex items-center justify-between rounded-lg border border-border bg-card px-4 py-3 text-left hover:border-primary/50">
-            <div>
-              <p className="font-semibold">{p.name} {!p.active && <Badge variant="secondary" className="ml-2">Inaktiv</Badge>}</p>
-              <p className="text-xs text-muted-foreground">{p.category} · {euro(p.minPriceCents)}–{euro(p.maxPriceCents)}, Basis {euro(p.basePriceCents)}</p>
-            </div>
-            <span className="font-bold text-primary">{p.currentPriceCents != null ? euro(p.currentPriceCents) : '–'}</span>
-          </button>
+          <div key={p.id} className="flex items-center gap-2 rounded-lg border border-border bg-card px-4 py-3">
+            <button onClick={() => openEdit(p)} className="flex-1 min-w-0 flex items-center justify-between text-left">
+              <div className="min-w-0">
+                <p className="font-semibold truncate">{p.name} {!p.active && <Badge variant="secondary" className="ml-2">Inaktiv</Badge>}</p>
+                <p className="text-xs text-muted-foreground">{p.category} · {euro(p.minPriceCents)}–{euro(p.maxPriceCents)}, Basis {euro(p.basePriceCents)}</p>
+              </div>
+              <span className="font-bold text-primary shrink-0 ml-2">{p.soldOut ? 'Aus' : (p.currentPriceCents != null ? euro(p.currentPriceCents) : '–')}</span>
+            </button>
+            <Button size="sm" variant={p.soldOut ? 'destructive' : 'outline'} className="shrink-0"
+              onClick={async () => { try { await api.updateProduct(p.id, { soldOut: !p.soldOut }); toast.success(p.soldOut ? `${p.name} wieder verfügbar` : `${p.name} als ausverkauft markiert`); refresh() } catch (e) { toast.error((e as Error).message) } }}>
+              {p.soldOut ? 'Ausverkauft' : 'Verfügbar'}
+            </Button>
+          </div>
         ))}
         {products.length === 0 && <p className="text-sm text-muted-foreground">Noch keine Getränke angelegt.</p>}
       </div>

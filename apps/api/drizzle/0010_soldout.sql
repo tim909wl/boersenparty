@@ -1,0 +1,1 @@
+ALTER TABLE products ADD COLUMN sold_out INTEGER NOT NULL DEFAULT 0 CHECK(sold_out IN (0,1));

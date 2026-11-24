@@ -35,19 +35,26 @@ body:has(.public-display){margin:0;overflow:hidden;overscroll-behavior:none;touc
 .tape b{font-weight:600}
 
 .category-board{flex:1 1 auto;min-height:0;padding:3.2vh 2em 2vh;display:flex;gap:4vw;overflow:hidden;background:var(--bg)}
-.market-column{flex:1 1 0;min-width:0;overflow:hidden;display:flex;flex-direction:column;gap:5vh}
-.market-category h2{margin:0;padding-bottom:.55em;border-bottom:1px solid var(--line);color:var(--muted);font-family:var(--display);font-size:1.55em;line-height:1;font-weight:600}
+.market-column{flex:1 1 0;min-width:0;overflow:hidden;display:flex;flex-direction:column;gap:calc(var(--u,36px)*.7)}
+.market-category h2{margin:0;padding-bottom:.3em;border-bottom:1px solid var(--line);color:var(--muted);font-family:var(--display);font-size:calc(var(--u,36px)*.36);line-height:1;font-weight:600}
 .security-list{display:flex;flex-direction:column}
 
-.market-row{min-width:0;min-height:7.5vh;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:calc(var(--u,36px)*.18)}
-.market-row h3{flex:1 1 auto;min-width:0;margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600;font-size:1.65em;line-height:1}
-.mini-chart{flex:0 0 calc(var(--u,36px)*1.05);height:2.6em;min-width:0}
+/* Row height, every column width and every font size below are all driven by the same --u unit,
+   which App.tsx derives from the SMALLER of (measured column width / 6.6) and (measured available
+   height / total row+header "units" in the heaviest column) — so adding more drinks shrinks
+   everything together instead of clipping rows off the bottom. Mirrors the prototype's own sizing
+   technique exactly. */
+.market-row{min-width:0;min-height:calc(var(--u,36px)*1.0);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:calc(var(--u,36px)*.18)}
+.market-row.out{opacity:.32}
+.market-row h3{flex:1 1 auto;min-width:0;margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600;font-size:calc(var(--u,36px)*.44);line-height:1}
+.mini-chart{flex:0 0 calc(var(--u,36px)*1.05);height:calc(var(--u,36px)*.52);min-width:0}
 .mini-chart canvas,.focus-chart canvas{display:block;width:100%;height:100%}
-.row-trend{flex:0 0 calc(var(--u,36px)*.82);text-align:right;font-family:var(--display);font-weight:600;font-size:1.1em;line-height:1;font-variant-numeric:tabular-nums;color:var(--soft);overflow:hidden}
+.row-trend{flex:0 0 calc(var(--u,36px)*.82);text-align:right;font-family:var(--display);font-weight:600;font-size:calc(var(--u,36px)*.26);line-height:1;font-variant-numeric:tabular-nums;color:var(--soft);overflow:hidden}
 .row-trend.positive{color:var(--up)} .row-trend.negative{color:var(--down)}
 .market-row .price{flex:0 0 calc(var(--u,36px)*1.62);text-align:right;white-space:nowrap;line-height:1}
 .price{font-family:var(--display);font-weight:700;font-variant-numeric:tabular-nums;overflow:hidden;display:inline-block}
-.market-row .price{font-size:2.25em;letter-spacing:-.025em}
+.market-row .price{font-size:calc(var(--u,36px)*.58);letter-spacing:-.025em}
+.market-row.out .price{font-size:calc(var(--u,36px)*.3);font-weight:600;color:var(--muted)}
 .price .n{display:inline-block}
 .price .c{font-size:.5em;font-weight:500;color:var(--soft);margin-left:.15em}
 .price .n.ru{animation:ru .7s cubic-bezier(.2,.8,.2,1)} .price .n.rd{animation:rd .7s cubic-bezier(.2,.8,.2,1)}
@@ -87,21 +94,15 @@ body:has(.public-display){margin:0;overflow:hidden;overscroll-behavior:none;touc
 @media(prefers-reduced-motion:reduce){.price .n.ru,.price .n.rd,.moment.on .k,.moment.on .h,.moment.on .s{animation:none}}
 
 .format-21x9 .category-board{padding-top:2vh}
-.format-21x9 .market-column{gap:3vh}
-.format-21x9 .market-row{min-height:6.5vh}
 .format-4x3{font-size:calc(13px * var(--display-scale))}
 .format-4x3 .category-board{gap:2.5vw;padding-left:1.4em;padding-right:1.4em}
 .format-9x16{font-size:calc(14px * var(--display-scale))}
 .format-9x16 .category-board{flex-direction:column}
-.format-9x16 .market-row{min-height:5.5em}
 @media(max-width:900px){
   .category-board{gap:2vw}
-  .market-row h3{font-size:1.35em}
-  .market-row .price{font-size:1.9em}
 }
 @media(max-width:620px){
   .market-header h1{font-size:1.55em}
   .market-header #clock{font-size:1.2em}
   .category-board{flex-direction:column}
-  .market-row{min-height:5.5em}
 }

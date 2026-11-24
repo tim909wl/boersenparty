@@ -47,4 +47,13 @@ describe('ProductAdminService', () => {
   it('rejects updates to a product that does not exist', () => {
     expect(() => products.update('missing', { name: 'x' }, actorId)).toThrow(/not found/i);
   });
+
+  it('marks a product sold out and back in stock', () => {
+    const created = products.create({ name: 'Mojito', category: 'Cocktails', basePriceCents: 500, minPriceCents: 300, maxPriceCents: 700 }, actorId);
+    expect(products.list().find(p => p.id === created.id)!.soldOut).toBe(false);
+    products.update(created.id, { soldOut: true }, actorId);
+    expect(products.list().find(p => p.id === created.id)!.soldOut).toBe(true);
+    products.update(created.id, { soldOut: false }, actorId);
+    expect(products.list().find(p => p.id === created.id)!.soldOut).toBe(false);
+  });
 });

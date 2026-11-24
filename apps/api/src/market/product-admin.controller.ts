@@ -5,7 +5,7 @@ import { ProductAdminService } from './product-admin.service.js';
 
 const money = z.number().int().min(0).max(100_000);
 const createSchema = z.object({ name: z.string().min(1).max(80), category: z.string().min(1).max(40), basePriceCents: money, minPriceCents: money, maxPriceCents: money });
-const updateSchema = createSchema.partial().extend({ active: z.boolean().optional() });
+const updateSchema = createSchema.partial().extend({ active: z.boolean().optional(), soldOut: z.boolean().optional() });
 
 @Controller('admin/products') @Roles('MARKET_MANAGER', 'ADMIN') export class ProductAdminController {
   constructor(private products: ProductAdminService) {}

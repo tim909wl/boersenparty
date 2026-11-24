@@ -43,6 +43,12 @@ function Sparkline({history,product,color,lineWidth=2}:{history:MarketPoint[];pr
 
 function MarketRow({product,history,charts}:{product:Product;history:MarketPoint[];charts:boolean}){
   const{percent,up,fixed,color}=marketTrend(product,history),flat=!fixed&&Math.round(percent)===0,roll=usePriceRoll(product.priceCents);
+  if(product.soldOut)return <article className="market-row out">
+    <h3>{product.name}</h3>
+    {charts&&<div className="mini-chart"/>}
+    <div className="row-trend"/>
+    <strong className="price"><span className="n">ausverkauft</span></strong>
+  </article>;
   return <article className="market-row">
     <h3>{product.name}</h3>
     {charts&&<div className="mini-chart"><Sparkline history={history} product={product} color={color}/></div>}
@@ -94,7 +100,7 @@ function MarketDisplay(){
   function detectMoments(list:Product[],crashingNow:boolean){
     const prev=prevProductsRef.current,now=Date.now();
     if(!crashingNow)for(const p of list){
-      const before=prev[p.id];if(!before||p.minPriceCents>=p.maxPriceCents)continue;
+      const before=prev[p.id];if(!before||p.minPriceCents>=p.maxPriceCents||p.soldOut)continue;
       if(p.priceCents>=p.maxPriceCents&&before.priceCents<p.maxPriceCents&&(coolRef.current[p.id+'hi']??0)<now){
         coolRef.current[p.id+'hi']=now+240000;
         momentQueueRef.current.push({tone:'up',title:p.name,sub:`${priceNum(p.priceCents)} € · teurer wird es nicht`});
@@ -134,14 +140,23 @@ function MarketDisplay(){
   const visible=config.category?products.filter(p=>p.category.localeCompare(config.category!,'de',{sensitivity:'base'})===0):products;
   visibleRef.current=visible;historyRef.current=history;
   const groups=Object.entries(visible.reduce<Record<string,Product[]>>((all,p)=>{(all[p.category]??=[]).push(p);return all},{}));
+  // Greedy bin-packing by row count (largest categories first, always into the currently lightest
+  // column) instead of a naive round-robin by category index — with 14-16+ drinks spread unevenly
+  // across categories, round-robin could pile most rows into one column while others sit empty.
   const columns=Array.from({length:config.categoryColumns},()=>[] as typeof groups);
-  groups.forEach((group,index)=>columns[index%columns.length].push(group));
+  const columnUnits=Array.from({length:config.categoryColumns},()=>0);
+  [...groups].sort((a,b)=>b[1].length-a[1].length).forEach(group=>{
+    let lightest=0;
+    for(let i=1;i<columnUnits.length;i++)if(columnUnits[i]<columnUnits[lightest])lightest=i;
+    columns[lightest].push(group);
+    columnUnits[lightest]+=0.85+group[1].length+0.7;
+  });
 
   // Rotates "Im Fokus" between the biggest real discount and the biggest real markup every 15s, as in the prototype's spot modes.
   useEffect(()=>{
     let first=true;const modeRef={current:'discount' as SpotMode};
     const pick=(mode:SpotMode)=>{
-      const candidates=visibleRef.current.filter(p=>p.minPriceCents<p.maxPriceCents).map(p=>({p,...marketTrend(p,historyRef.current)}));
+      const candidates=visibleRef.current.filter(p=>p.minPriceCents<p.maxPriceCents&&!p.soldOut).map(p=>({p,...marketTrend(p,historyRef.current)}));
       if(!candidates.length)return null;
       const best=mode==='discount'?candidates.reduce((a,b)=>b.percent<a.percent?b:a):candidates.reduce((a,b)=>b.percent>a.percent?b:a);
       return(mode==='discount'?best.percent<=-3:best.percent>=3)?best.p:null;
@@ -165,9 +180,14 @@ function MarketDisplay(){
   },[]);
   const focusProduct=spot&&visible.find(p=>p.id===spot.id);
 
-  // Measures the real rendered column width (not an assumed viewport) and derives a px unit that
-  // every row dimension scales from, so layout can never overflow regardless of how a TV's browser
-  // reports or scales its viewport. Mirrors the prototype's own --u sizing technique.
+  // Measures the real rendered column width AND height (not an assumed viewport) and derives a px
+  // unit that every row's width, height and font size scale from — both axes are checked and the
+  // smaller wins, so the board shrinks to fit rather than overflowing with many drinks, and can
+  // never overflow regardless of how a TV's browser reports or scales its viewport. Mirrors the
+  // prototype's own --u sizing technique (including its per-category "0.85 header + rows + 0.7
+  // gap" unit budgeting used below to find the heaviest column).
+  const maxColumnUnits=Math.max(1,...columnUnits);
+  const totalUnitsSignature=columnUnits.join(',');
   const boardRef=useRef<HTMLElement>(null);
   const[unit,setUnit]=useState(36);
   useEffect(()=>{
@@ -177,15 +197,18 @@ function MarketDisplay(){
       const cols=stacked?1:Math.max(1,config.categoryColumns);
       const gap=stacked?0:parseFloat(cs.columnGap)||0;
       const perColumn=(el.clientWidth-gap*(cols-1))/cols;
-      setUnit(Math.max(20,Math.min(90,perColumn/6.6)));
+      const horizontal=perColumn/6.6;
+      const totalUnitsForHeight=stacked?columnUnits.reduce((a,b)=>a+b,0):maxColumnUnits;
+      const vertical=el.clientHeight/Math.max(1,totalUnitsForHeight);
+      setUnit(Math.max(16,Math.min(90,Math.min(horizontal,vertical))));
     };
     compute();
     const ro=new ResizeObserver(compute);ro.observe(el);
     return()=>ro.disconnect();
-  },[config.categoryColumns]);
+  },[config.categoryColumns,maxColumnUnits,totalUnitsSignature]);
 
   const mode=health?.state?.mode??'VERBINDE…';
-  const footerNote=mode==='PAYMENT_STOP'?'Zahlungen gestoppt':mode==='PRICE_FROZEN'?'Preise eingefroren · letzter Stand':'Restguthaben gibt es am Ende an der Wechselbude zurück';
+  const footerNote=mode==='PAYMENT_STOP'?'Zahlungen gestoppt':mode==='PRICE_FROZEN'?'Preise eingefroren · letzter Stand':'';
   const style={'--display-scale':config.scale,'--overscan':`${config.overscan}vmin`} as CSSProperties;
 
   const crashLeft=crash?Math.max(0,Math.ceil((crash.until-clock.getTime())/1000)):0;

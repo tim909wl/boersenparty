@@ -11,7 +11,7 @@ describe('MarketService history',()=>{
 
   it('returns real price versions in chronological order',()=>{
     const product=id(),first=id(),second=id();
-    db.raw.prepare('INSERT INTO products VALUES(?,?,?,?,?,?,1)').run(product,'Cola','Alkoholfrei',250,150,400);
+    db.raw.prepare('INSERT INTO products VALUES(?,?,?,?,?,?,1,0)').run(product,'Cola','Alkoholfrei',250,150,400);
     db.raw.prepare("INSERT INTO price_versions VALUES(?,1,'SUPERSEDED',1000,1000)").run(first);
     db.raw.prepare("INSERT INTO price_versions VALUES(?,2,'ACTIVE',2000,2000)").run(second);
     db.raw.prepare('INSERT INTO price_entries VALUES(?,?,?)').run(first,product,250);
@@ -21,6 +21,15 @@ describe('MarketService history',()=>{
       {version:1,effectiveAt:1000,prices:{[product]:250}},
       {version:2,effectiveAt:2000,prices:{[product]:275}},
     ]});
+  });
+
+  it('refuses to quote a sold-out product, and list() reports it as sold out',()=>{
+    const product=id(),pv=id();
+    db.raw.prepare('INSERT INTO products VALUES(?,?,?,?,?,?,1,1)').run(product,'Cola','Alkoholfrei',250,150,400);
+    db.raw.prepare("INSERT INTO price_versions VALUES(?,1,'ACTIVE',?,?)").run(pv,Date.now(),Date.now());
+    db.raw.prepare('INSERT INTO price_entries VALUES(?,?,?)').run(pv,product,250);
+    expect((market.list() as any[])[0].soldOut).toBe(true);
+    expect(()=>market.quote([{productId:product,quantity:1}])).toThrow(/ausverkauft/i);
   });
 });
 
@@ -36,8 +45,8 @@ describe('MarketService crash',()=>{
     db.raw.prepare('INSERT INTO users(id,username,password_hash,active,created_at) VALUES(?,?,?,1,?)').run(actorId,'manager','x',Date.now());
     db.raw.prepare("UPDATE system_state SET mode='NORMAL'").run();
     product=id();other=id();
-    db.raw.prepare('INSERT INTO products VALUES(?,?,?,?,?,?,1)').run(product,'Cola','Alkoholfrei',250,150,400);
-    db.raw.prepare('INSERT INTO products VALUES(?,?,?,?,?,?,1)').run(other,'Wasser','Alkoholfrei',200,150,300);
+    db.raw.prepare('INSERT INTO products VALUES(?,?,?,?,?,?,1,0)').run(product,'Cola','Alkoholfrei',250,150,400);
+    db.raw.prepare('INSERT INTO products VALUES(?,?,?,?,?,?,1,0)').run(other,'Wasser','Alkoholfrei',200,150,300);
     const pv=id();
     db.raw.prepare("INSERT INTO price_versions VALUES(?,1,'ACTIVE',?,?)").run(pv,Date.now(),Date.now());
     db.raw.prepare('INSERT INTO price_entries VALUES(?,?,?)').run(pv,product,250);
