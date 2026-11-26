@@ -33,6 +33,7 @@ export class Api{
   createSignedReport(){return this.call<any>('/operations/signed-reports',{method:'POST',body:'{}'})}
   users(){return this.call<any[]>('/admin/users')}
   createUser(username:string,password:string,roles:string[]){return this.call<any>('/admin/users',{method:'POST',body:JSON.stringify({username,password,roles})})}
+  setUserRoles(id:string,roles:string[],password?:string){return this.call<any>(`/admin/users/${id}/roles`,{method:'PATCH',body:JSON.stringify({roles,password})})}
   setUserActive(id:string,active:boolean){return this.call<any>(`/admin/users/${id}/active`,{method:'PATCH',body:JSON.stringify({active})})}
   unlockUser(id:string){return this.call<any>(`/admin/users/${id}/unlock`,{method:'POST',body:'{}'})}
   adminProducts(){return this.call<AdminProduct[]>('/admin/products')}

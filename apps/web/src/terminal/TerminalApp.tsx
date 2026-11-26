@@ -17,7 +17,8 @@ import { Toaster } from '@/components/ui/sonner';
 
 declare global { interface Window { onNfcUid?: (uid: string) => void; NDEFReader?: new () => { scan(): Promise<void>; onreading: ((e: any) => void) | null } } }
 const nfcSupported = typeof window !== 'undefined' && 'NDEFReader' in window && window.isSecureContext;
-const euro = (c: number) => new Intl.NumberFormat('de-DE', { style: 'currency', currency: 'EUR' }).format(c / 100);
+const currency = new Intl.NumberFormat('de-DE', { style: 'currency', currency: 'EUR' });
+const euro = (c: number) => currency.format(c / 100);
 const toCents = (v: string) => Math.round(Number(v.replace(',', '.')) * 100);
 
 type PendingOperation = { type: 'purchase'; key: string; uid: string; quoteId: string } | { type: 'topup'; key: string; uid: string; amountCents: number };
@@ -44,6 +45,8 @@ export default function TerminalApp() {
   const [nfcActive, setNfcActive] = useState(false);
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem('sidebar-collapsed') === '1');
   const submittingRef = useRef(false);
+  const [submitting, setSubmitting] = useState(false);
+  const nfcStarting = useRef(false);
   function toggleCollapsed() { setCollapsed(c => { localStorage.setItem('sidebar-collapsed', c ? '0' : '1'); return !c }) }
 
   useEffect(() => {
@@ -51,13 +54,22 @@ export default function TerminalApp() {
     return () => { delete window.onNfcUid };
   }, []);
   useEffect(() => {
-    const refresh = () => { api.products().then(setProducts).catch(() => {}); api.health().then(setHealth).catch(() => setHealth({ ok: false })) };
-    refresh();
+    if (!authenticated) return;
+    let stopped = false, running = false;
+    const refresh = async () => {
+      if (running || stopped) return;
+      running = true;
+      try { await Promise.all([api.products().then(p => { if (!stopped) setProducts(p) }).catch(() => {}), api.health().then(h => { if (!stopped) setHealth(h) }).catch(() => { if (!stopped) setHealth({ ok: false }) })]) }
+      finally { running = false }
+    };
+    void refresh();
     const t = setInterval(refresh, 5000);
-    return () => clearInterval(t);
-  }, [api]);
+    return () => { stopped = true; clearInterval(t) };
+  }, [api, authenticated]);
 
   async function startNfc() {
+    if (nfcStarting.current || nfcActive) return;
+    nfcStarting.current = true;
     try {
       const reader = new window.NDEFReader!();
       await reader.scan();
@@ -66,7 +78,7 @@ export default function TerminalApp() {
         const raw = String(e.serialNumber ?? '').replace(/[:-]/g, '').toUpperCase();
         if (raw) { setUid(raw); toast.info(`Armband gelesen (Web NFC): ${raw}`) }
       };
-    } catch (e) { toast.error(`NFC konnte nicht gestartet werden: ${(e as Error).message}`) }
+    } catch (e) { toast.error(`NFC konnte nicht gestartet werden: ${(e as Error).message}`) } finally { nfcStarting.current = false }
   }
 
   function remember(x: PendingOperation | null) {
@@ -93,22 +105,22 @@ export default function TerminalApp() {
 
   async function pay() {
     if (pending || submittingRef.current) return toast.warning('Zuerst den ungeklärten Vorgang prüfen.');
-    submittingRef.current = true;
+    submittingRef.current = true; setSubmitting(true);
     try {
       const items = Object.entries(cart).filter(([, q]) => q).map(([productId, quantity]) => ({ productId, quantity }));
       const q = await api.quote(items);
       const x: PendingOperation = { type: 'purchase', key: uuid(), uid, quoteId: q.quoteId };
       remember(x); await execute(x);
-    } catch (e) { toast.error(`NICHT BEZAHLT: ${(e as Error).message}`) } finally { submittingRef.current = false }
+    } catch (e) { toast.error(`NICHT BEZAHLT: ${(e as Error).message}`) } finally { submittingRef.current = false; setSubmitting(false) }
   }
 
   async function topup(amount: number) {
     if (pending || submittingRef.current) return toast.warning('Zuerst den ungeklärten Vorgang prüfen.');
-    submittingRef.current = true;
+    submittingRef.current = true; setSubmitting(true);
     try {
       const x: PendingOperation = { type: 'topup', key: uuid(), uid, amountCents: amount };
       remember(x); await execute(x);
-    } finally { submittingRef.current = false }
+    } finally { submittingRef.current = false; setSubmitting(false) }
   }
 
   if (!authenticated) return <Login api={api} done={() => setAuthenticated(true)} />;
@@ -149,6 +161,7 @@ export default function TerminalApp() {
       <header className="sm:hidden flex items-center justify-between px-4 py-3 border-b border-border">
         <p className="font-bold">Börsenparty</p>
         <div className="flex items-center gap-2">
+          <Button variant="ghost" size="icon" aria-label="Abmelden" onClick={() => { api.setToken(''); location.reload() }}><LogOut className="h-4 w-4" /></Button>
           {nfcSupported && <Button variant={nfcActive ? 'success' : 'outline'} size="sm" onClick={startNfc} disabled={nfcActive}><Nfc className="h-4 w-4" /></Button>}
           <Badge variant={connected ? 'success' : 'destructive'}>{mode}</Badge>
         </div>
@@ -163,15 +176,14 @@ export default function TerminalApp() {
                 <p className="text-xs text-muted-foreground">{pending.type === 'purchase' ? 'Zahlung' : 'Aufladung'} · Armband {pending.uid}</p>
               </div>
               <div className="flex gap-2 shrink-0">
-                <Button size="sm" variant="outline" onClick={() => { remember(null); toast.info('Verworfen – neuen Versuch starten.') }}>Verwerfen</Button>
-                <Button size="sm" onClick={() => execute(pending)}>Erneut prüfen</Button>
+                <Button size="sm" disabled={submitting} onClick={async () => { if (submittingRef.current) return; submittingRef.current = true; setSubmitting(true); try { await execute(pending) } finally { submittingRef.current = false; setSubmitting(false) } }}>{submitting ? 'Prüfe…' : 'Erneut prüfen'}</Button>
               </div>
             </CardContent>
           </Card>
         )}
 
-        {view === 'pos' && <PosView uid={uid} setUid={setUid} products={products} cart={cart} setCart={setCart} onPay={pay} disabled={Boolean(pending)} />}
-        {view === 'topup' && <TopupView uid={uid} setUid={setUid} onTopup={topup} disabled={Boolean(pending)} />}
+        {view === 'pos' && <PosView uid={uid} setUid={setUid} products={products} cart={cart} setCart={setCart} onPay={pay} disabled={Boolean(pending) || submitting} />}
+        {view === 'topup' && <TopupView uid={uid} setUid={setUid} onTopup={topup} disabled={Boolean(pending) || submitting} />}
         {view === 'products' && <ProductsView api={api} />}
         {view === 'market' && <MarketView products={products} />}
         {view === 'ops' && <OpsView api={api} health={health} />}
@@ -223,7 +235,9 @@ function UidScanner({ uid, setUid }: { uid: string; setUid: (x: string) => void 
 }
 
 function Login({ api, done }: { api: Api; done: () => void }) {
-  const [user, setUser] = useState('admin');
+  const [user, setUser] = useState('');
+  const [personal, setPersonal] = useState(false);
+  const loginLock = useRef(false);
   const [password, setPassword] = useState('');
   const [terminal, setTerminal] = useState('11111111-1111-4111-8111-111111111111');
   const [error, setError] = useState('');
@@ -235,9 +249,10 @@ function Login({ api, done }: { api: Api; done: () => void }) {
     { id: '44444444-4444-4444-8444-444444444444', name: 'Admin' },
   ];
   async function submit() {
-    setBusy(true); setError('');
+    if (loginLock.current || !user.trim() || (!personal && !/^\d{4}$/.test(password))) return;
+    loginLock.current = true; setBusy(true); setError('');
     try { const r = await api.login(user, password, terminal); api.setToken(r.accessToken); done() }
-    catch (e) { setError((e as Error).message) } finally { setBusy(false) }
+    catch (e) { setError((e as Error).message) } finally { loginLock.current = false; setBusy(false) }
   }
   return (
     <div className="min-h-dvh flex items-center justify-center bg-background p-4">
@@ -252,8 +267,9 @@ function Login({ api, done }: { api: Api; done: () => void }) {
             <Input id="user" value={user} onChange={e => setUser(e.target.value)} autoFocus />
           </div>
           <div className="flex flex-col gap-2">
-            <Label htmlFor="pw">Passwort</Label>
-            <Input id="pw" type="password" value={password} onChange={e => setPassword(e.target.value)} onKeyDown={e => e.key === 'Enter' && submit()} />
+            <Label htmlFor="pw">{personal ? 'Persönliches Passwort' : 'Team-PIN (4 Ziffern)'}</Label>
+            <Input id="pw" type="password" inputMode={personal ? 'text' : 'numeric'} maxLength={personal ? 128 : 4} autoComplete="current-password" value={password} onChange={e => setPassword(personal ? e.target.value : e.target.value.replace(/\D/g, '').slice(0, 4))} onKeyDown={e => e.key === 'Enter' && submit()} />
+            <Button type="button" variant="ghost" size="sm" onClick={() => { setPersonal(!personal); setPassword(''); setError('') }}>{personal ? 'Mit Team-PIN anmelden' : 'Leitung / persönliches Passwort'}</Button>
           </div>
           <div className="flex flex-col gap-2">
             <Label>Terminal</Label>
@@ -265,7 +281,7 @@ function Login({ api, done }: { api: Api; done: () => void }) {
           {error && <p className="text-sm text-destructive">{error}</p>}
         </CardContent>
         <CardFooter>
-          <Button className="w-full" size="lg" onClick={submit} disabled={busy}>Anmelden</Button>
+          <Button className="w-full" size="lg" onClick={submit} disabled={busy || !user.trim() || (personal ? !password : password.length !== 4)}>{busy ? 'Anmeldung…' : 'Anmelden'}</Button>
         </CardFooter>
       </Card>
     </div>
@@ -578,43 +594,47 @@ function ApprovalPanel({ api }: { api: Api }) {
   );
 }
 
+const TEAM_ROLES = [
+  {id:'BAR', label:'Kasse / Getränke verkaufen'}, {id:'TOPUP', label:'Guthaben aufladen'},
+  {id:'MARKET_MANAGER', label:'Börsensteuerung'}, {id:'PAYMENT_LEAD', label:'Zahlungsleitung'},
+  {id:'ADMIN', label:'Administration'}, {id:'AUDITOR', label:'Prüfung / Berichte'},
+];
+const teamPinRoles = (roles: string[]) => roles.length > 0 && roles.every(r => r === 'BAR' || r === 'TOPUP');
+function RoleCheckboxes({ roles, change, disabled }: { roles: string[]; change: (roles: string[]) => void; disabled?: boolean }) {
+  return <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">{TEAM_ROLES.map(r => <label key={r.id} className="flex items-center gap-3 rounded-md border border-border p-3 text-sm cursor-pointer"><input type="checkbox" className="h-5 w-5 accent-primary" checked={roles.includes(r.id)} disabled={disabled} onChange={e => change(e.target.checked ? [...roles,r.id] : roles.filter(x=>x!==r.id))}/>{r.label}</label>)}</div>;
+}
 function UserPanel({ api }: { api: Api }) {
   const [users, setUsers] = useState<any[]>([]);
-  const [username, setUsername] = useState(''); const [password, setPassword] = useState(''); const [role, setRole] = useState('BAR');
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [roles, setRoles] = useState<string[]>(['BAR']);
+  const [editing, setEditing] = useState<any>(null);
+  const [editRoles, setEditRoles] = useState<string[]>([]);
+  const [editPassword, setEditPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const lock = useRef(false);
   const refresh = () => api.users().then(setUsers).catch(e => toast.error(e.message));
   useEffect(() => { void refresh() }, [api]);
-  const action = async (fn: () => Promise<any>) => { try { await fn(); toast.success('Änderung gespeichert'); setPassword(''); await refresh() } catch (e) { toast.error((e as Error).message) } };
-  return (
-    <div className="flex flex-col gap-4">
-      <Card>
-        <CardHeader><CardTitle className="flex items-center gap-2"><Users className="h-4 w-4" />Neues Konto</CardTitle></CardHeader>
-        <CardContent>
-          <div className="flex flex-col gap-1.5"><Label>Benutzername</Label><Input value={username} onChange={e => setUsername(e.target.value)} /></div>
-          <div className="flex flex-col gap-1.5"><Label>Temporäres Passwort</Label><Input type="password" value={password} onChange={e => setPassword(e.target.value)} /></div>
-          <div className="flex flex-col gap-1.5">
-            <Label>Rolle</Label>
-            <Select value={role} onValueChange={setRole}>
-              <SelectTrigger><SelectValue /></SelectTrigger>
-              <SelectContent>{['BAR', 'TOPUP', 'MARKET_MANAGER', 'PAYMENT_LEAD', 'ADMIN', 'AUDITOR'].map(x => <SelectItem key={x} value={x}>{x}</SelectItem>)}</SelectContent>
-            </Select>
-          </div>
-          <Button onClick={() => action(() => api.createUser(username, password, [role]))}>Konto anlegen</Button>
-        </CardContent>
-      </Card>
-      <div className="flex flex-col gap-2">
-        {users.map(u => (
-          <div key={u.id} className="flex items-center justify-between rounded-lg border border-border bg-card px-4 py-3">
-            <div>
-              <p className="font-semibold">{u.username}</p>
-              <p className="text-xs text-muted-foreground">{u.roles.join(', ')} · {u.active ? 'aktiv' : 'deaktiviert'}{u.lockedUntil > Date.now() ? ' · gesperrt' : ''}</p>
-            </div>
-            <div className="flex gap-2">
-              {u.lockedUntil > Date.now() && <Button size="sm" variant="outline" onClick={() => action(() => api.unlockUser(u.id))}>Entsperren</Button>}
-              <Button size="sm" variant={u.active ? 'outline' : 'secondary'} onClick={() => action(() => api.setUserActive(u.id, !u.active))}>{u.active ? 'Deaktivieren' : 'Aktivieren'}</Button>
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
+  const action = async (fn: () => Promise<any>, done?: () => void) => { if(lock.current)return; lock.current=true;setBusy(true);try { await fn(); done?.(); toast.success('Änderung gespeichert'); await refresh() } catch (e) { toast.error((e as Error).message) } finally { lock.current=false;setBusy(false) } };
+  const needsPassword = editing && teamPinRoles(editing.roles) && !teamPinRoles(editRoles);
+  return <div className="flex flex-col gap-4">
+    <Card><CardHeader><CardTitle className="flex items-center gap-2"><Users className="h-4 w-4" />Neues Konto</CardTitle><CardDescription>Bar und Aufladung verwenden die Team-PIN. Leitungsrollen benötigen ein eigenes Passwort.</CardDescription></CardHeader>
+    <CardContent className="flex flex-col gap-3">
+      <Label htmlFor="new-user">Benutzername</Label><Input id="new-user" value={username} onChange={e=>setUsername(e.target.value)} />
+      <RoleCheckboxes roles={roles} change={setRoles} disabled={busy} />
+      {!teamPinRoles(roles)&&<><Label htmlFor="new-password">Persönliches Passwort (mind. 12 Zeichen)</Label><Input id="new-password" type="password" value={password} onChange={e=>setPassword(e.target.value)} /></>}
+      <Button disabled={busy||!username.trim()||!roles.length||(!teamPinRoles(roles)&&password.length<12)} onClick={()=>action(()=>api.createUser(username,teamPinRoles(roles)?'':password,roles),()=>{setUsername('');setPassword('');setRoles(['BAR'])})}>Konto anlegen</Button>
+    </CardContent></Card>
+    {users.map(u=><Card key={u.id}><CardContent className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-4">
+      <div className="min-w-0"><p className="font-semibold break-all">{u.username}</p><p className="text-xs text-muted-foreground">{u.roles.map((r:string)=>TEAM_ROLES.find(x=>x.id===r)?.label??r).join(' · ')} · {u.active?'aktiv':'deaktiviert'}{u.lockedUntil>Date.now()?' · gesperrt':''}</p></div>
+      <div className="flex flex-wrap gap-2"><Button size="sm" disabled={busy} onClick={()=>{setEditing(u);setEditRoles([...u.roles]);setEditPassword('')}}>Berechtigungen</Button>
+        {u.lockedUntil>Date.now()&&<Button size="sm" variant="outline" disabled={busy} onClick={()=>action(()=>api.unlockUser(u.id))}>Entsperren</Button>}
+        <Button size="sm" variant="outline" disabled={busy} onClick={()=>action(()=>api.setUserActive(u.id,!u.active))}>{u.active?'Deaktivieren':'Aktivieren'}</Button></div>
+    </CardContent></Card>)}
+    <Dialog open={Boolean(editing)} onOpenChange={open=>{if(!open&&!busy)setEditing(null)}}><DialogContent className="max-h-[90vh] overflow-y-auto"><DialogHeader><DialogTitle>Berechtigungen: {editing?.username}</DialogTitle><DialogDescription>Änderungen gelten sofort für laufende Sitzungen. Bei Wechsel zur Leitung ist eine neue Anmeldung erforderlich.</DialogDescription></DialogHeader>
+      <RoleCheckboxes roles={editRoles} change={setEditRoles} disabled={busy}/>
+      {needsPassword&&<div className="flex flex-col gap-2"><Label htmlFor="edit-password">Neues persönliches Passwort (mind. 12 Zeichen)</Label><Input id="edit-password" type="password" value={editPassword} onChange={e=>setEditPassword(e.target.value)}/></div>}
+      <DialogFooter><Button variant="outline" disabled={busy} onClick={()=>setEditing(null)}>Abbrechen</Button><Button disabled={busy||!editRoles.length||Boolean(needsPassword&&editPassword.length<12)} onClick={()=>editing&&action(()=>api.setUserRoles(editing.id,editRoles,needsPassword?editPassword:undefined),()=>{setEditing(null);setEditPassword('')})}>Speichern</Button></DialogFooter>
+    </DialogContent></Dialog>
+  </div>;
 }
