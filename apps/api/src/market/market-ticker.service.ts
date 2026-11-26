@@ -3,7 +3,7 @@ import { Interval } from '@nestjs/schedule';
 import { DomainError } from '../common/domain-error.js';
 import { MarketService } from './market.service.js';
 
-const interval=Math.max(10_000,Number(process.env.MARKET_TICK_INTERVAL_MS) || 60_000);
+const interval=Math.max(10_000,Number(process.env.MARKET_TICK_INTERVAL_MS) || 30_000);
 
 @Injectable()
 export class MarketTickerService {

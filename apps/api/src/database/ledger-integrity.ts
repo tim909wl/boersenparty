@@ -1,0 +1,27 @@
+import type Database from 'better-sqlite3';
+import { DomainError } from '../common/domain-error.js';
+export function ledgerIssues(db: Database.Database): string[] {
+  const checks: [string,string][] = [
+    ['WALLET_ACCOUNT', `SELECT 1 FROM wallets w LEFT JOIN ledger_accounts a ON a.wallet_id=w.id AND a.type='WALLET' GROUP BY w.id HAVING COUNT(a.id)<>1 LIMIT 1`],
+    ['CLEARING_ACCOUNT', `SELECT 1 FROM (SELECT 'CASH_CLEARING' type UNION ALL SELECT 'CARD_CLEARING' UNION ALL SELECT 'SALES' UNION ALL SELECT 'REFUND_CLEARING' UNION ALL SELECT 'STARTING_BALANCE') t LEFT JOIN ledger_accounts a ON a.type=t.type AND a.wallet_id IS NULL AND a.currency='EUR' GROUP BY t.type HAVING COUNT(a.id)<>1 LIMIT 1`],
+    ['WALLET_CURRENCY', `SELECT 1 FROM ledger_accounts WHERE currency<>'EUR' LIMIT 1`],
+    ['CLOSED_BALANCE', `SELECT 1 FROM wallets WHERE status='CLOSED' AND balance_cents<>0 LIMIT 1`],
+    ['WALLET_BALANCE', `SELECT 1 FROM wallets w LEFT JOIN ledger_accounts a ON a.wallet_id=w.id LEFT JOIN ledger_entries e ON e.account_id=a.id GROUP BY w.id HAVING w.balance_cents<>COALESCE(SUM(e.amount_cents),0) LIMIT 1`],
+    ['ASSIGNMENT', `SELECT 1 FROM wristbands b LEFT JOIN wristband_assignments a ON a.wristband_id=b.id AND a.revoked_at IS NULL LEFT JOIN wallets w ON w.id=a.wallet_id WHERE b.status='ACTIVE' AND (a.id IS NULL OR w.status<>'ACTIVE') LIMIT 1`],
+    ['OPERATION_BALANCE', `SELECT 1 FROM financial_operations f LEFT JOIN ledger_entries e ON e.operation_id=f.id LEFT JOIN orders o ON o.operation_id=f.id WHERE f.status='COMMITTED' GROUP BY f.id HAVING COALESCE(SUM(e.amount_cents),0)<>0 OR (COUNT(e.id)<2 AND NOT(f.type='PURCHASE' AND COALESCE(o.total_cents,-1)=0)) LIMIT 1`],
+    ['NONCOMMITTED_ENTRIES', `SELECT 1 FROM ledger_entries e JOIN financial_operations f ON f.id=e.operation_id WHERE f.status<>'COMMITTED' LIMIT 1`],
+    ['MISSING_OPERATION_DETAIL', `SELECT 1 FROM financial_operations f WHERE f.status='COMMITTED' AND ((f.type='TOPUP' AND NOT EXISTS(SELECT 1 FROM topups t WHERE t.operation_id=f.id)) OR (f.type='PURCHASE' AND NOT EXISTS(SELECT 1 FROM orders o WHERE o.operation_id=f.id)) OR (f.type='REFUND' AND NOT EXISTS(SELECT 1 FROM refunds r WHERE r.operation_id=f.id))) LIMIT 1`],
+    ['TOPUP_POSTINGS', `SELECT 1 FROM topups t JOIN financial_operations f ON f.id=t.operation_id WHERE t.status='COMMITTED' AND (f.status<>'COMMITTED' OR f.type<>'TOPUP' OR (SELECT COUNT(*) FROM ledger_entries e WHERE e.operation_id=f.id)<>2 OR NOT EXISTS(SELECT 1 FROM ledger_entries e JOIN ledger_accounts a ON a.id=e.account_id WHERE e.operation_id=f.id AND a.type='WALLET' AND a.wallet_id=t.wallet_id AND e.amount_cents=t.amount_cents) OR NOT EXISTS(SELECT 1 FROM ledger_entries e JOIN ledger_accounts a ON a.id=e.account_id WHERE e.operation_id=f.id AND a.type=CASE t.funding_method WHEN 'CASH' THEN 'CASH_CLEARING' ELSE 'CARD_CLEARING' END AND e.amount_cents=-t.amount_cents)) LIMIT 1`],
+    ['PURCHASE_POSTINGS', `SELECT 1 FROM orders o JOIN financial_operations f ON f.id=o.operation_id WHERE f.type<>'PURCHASE' OR f.status<>'COMMITTED' OR (o.total_cents=0 AND EXISTS(SELECT 1 FROM ledger_entries e WHERE e.operation_id=f.id)) OR (o.total_cents>0 AND ((SELECT COUNT(*) FROM ledger_entries e WHERE e.operation_id=f.id)<>2 OR NOT EXISTS(SELECT 1 FROM ledger_entries e JOIN ledger_accounts a ON a.id=e.account_id WHERE e.operation_id=f.id AND a.wallet_id=o.wallet_id AND a.type='WALLET' AND e.amount_cents=-o.total_cents) OR NOT EXISTS(SELECT 1 FROM ledger_entries e JOIN ledger_accounts a ON a.id=e.account_id WHERE e.operation_id=f.id AND a.type='SALES' AND e.amount_cents=o.total_cents))) LIMIT 1`],
+    ['REFUND_POSTINGS', `SELECT 1 FROM refunds r JOIN orders o ON o.id=r.original_order_id JOIN financial_operations f ON f.id=r.operation_id WHERE f.type<>'REFUND' OR f.status<>'COMMITTED' OR (SELECT COUNT(*) FROM ledger_entries e WHERE e.operation_id=f.id)<>2 OR NOT EXISTS(SELECT 1 FROM ledger_entries e JOIN ledger_accounts a ON a.id=e.account_id WHERE e.operation_id=f.id AND a.type='WALLET' AND a.wallet_id=o.wallet_id AND e.amount_cents=r.amount_cents) OR NOT EXISTS(SELECT 1 FROM ledger_entries e JOIN ledger_accounts a ON a.id=e.account_id WHERE e.operation_id=f.id AND a.type='SALES' AND e.amount_cents=-r.amount_cents) LIMIT 1`],
+    ['REFUND_TOTAL', `SELECT 1 FROM orders o LEFT JOIN refunds r ON r.original_order_id=o.id GROUP BY o.id HAVING COALESCE(SUM(r.amount_cents),0)>o.total_cents OR (o.status='REFUNDED' AND COALESCE(SUM(r.amount_cents),0)<>o.total_cents) LIMIT 1`],
+    ['CASH_SESSION',  `SELECT 1 FROM topups t LEFT JOIN cash_session_operations c ON c.operation_id=t.operation_id LEFT JOIN cash_sessions s ON s.id=c.cash_session_id JOIN financial_operations f ON f.id=t.operation_id WHERE t.funding_method='CASH' AND t.status='COMMITTED' AND (c.operation_id IS NULL OR c.amount_cents<>t.amount_cents OR s.terminal_id<>f.terminal_id) LIMIT 1`],
+    ['FREE_DRINK_REDEMPTION', `SELECT 1 FROM free_drink_entitlements f JOIN orders o ON o.id=f.redeemed_order_id WHERE o.wallet_id<>f.wallet_id OR o.total_cents<>0 LIMIT 1`],
+    ['PENDING_OPERATION', `SELECT 1 FROM financial_operations WHERE status='PENDING' LIMIT 1`],
+  ];
+  return checks.filter(([,sql])=>Boolean(db.prepare(sql).get())).map(([name])=>name);
+}
+export function assertLedgerReady(db: Database.Database) {
+  const issues=ledgerIssues(db);
+  if(issues.length) throw new DomainError('LEDGER_MISCONFIGURED', 'Buchhaltung inkonsistent: '+issues.join(', '), 503);
+}

@@ -51,13 +51,18 @@ function validateRange(x: ProductInput) {
       const soldOut = patch.soldOut ?? Boolean(current.soldOut);
       this.db.raw.prepare('UPDATE products SET name=?,category=?,base_price_cents=?,min_price_cents=?,max_price_cents=?,active=?,sold_out=? WHERE id=?')
         .run(merged.name.trim(), merged.category.trim(), merged.basePriceCents, merged.minPriceCents, merged.maxPriceCents, active ? 1 : 0, soldOut ? 1 : 0, productId);
-      // Keep the live price inside the (possibly narrowed) range rather than waiting for the next tick.
+      // An explicit new base price means "start the market fresh here" — snap the live price to
+      // it directly rather than just clamping the old price into the new range, otherwise e.g.
+      // dropping the base from 3,00€ to 1,50€ while also narrowing max to 2,50€ would leave the
+      // board showing 2,50€ (clamped to the new max) instead of the 1,50€ that was actually asked
+      // for. An update that only narrows min/max without touching base keeps the old clamp-only
+      // behavior, so an unrelated edit mid-event doesn't erase a live crash/trend.
       const activeVersion = this.db.raw.prepare("SELECT id FROM price_versions WHERE status='ACTIVE'").get() as any;
       if (activeVersion) {
         const entry = this.db.raw.prepare('SELECT price_cents priceCents FROM price_entries WHERE price_version_id=? AND product_id=?').get(activeVersion.id, productId) as any;
         if (entry) {
-          const clamped = Math.max(merged.minPriceCents, Math.min(merged.maxPriceCents, entry.priceCents));
-          if (clamped !== entry.priceCents) this.db.raw.prepare('UPDATE price_entries SET price_cents=? WHERE price_version_id=? AND product_id=?').run(clamped, activeVersion.id, productId);
+          const target = patch.basePriceCents !== undefined ? merged.basePriceCents : Math.max(merged.minPriceCents, Math.min(merged.maxPriceCents, entry.priceCents));
+          if (target !== entry.priceCents) this.db.raw.prepare('UPDATE price_entries SET price_cents=? WHERE price_version_id=? AND product_id=?').run(target, activeVersion.id, productId);
         } else {
           this.db.raw.prepare('INSERT INTO price_entries VALUES(?,?,?)').run(activeVersion.id, productId, merged.basePriceCents);
         }

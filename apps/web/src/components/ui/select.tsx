@@ -39,7 +39,9 @@ const SelectContent = React.forwardRef<React.ElementRef<typeof SelectPrimitive.C
         )}
         {...props}
       >
-        <SelectPrimitive.Viewport className="p-1">{children}</SelectPrimitive.Viewport>
+        <SelectPrimitive.Viewport className="p-1">
+          <SelectPrimitive.Group>{children}</SelectPrimitive.Group>
+        </SelectPrimitive.Viewport>
       </SelectPrimitive.Content>
     </SelectPrimitive.Portal>
   ),

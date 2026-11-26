@@ -1,12 +1,14 @@
 import { afterEach,beforeEach,describe,expect,it } from 'vitest';
+import { SchedulerRegistry } from '@nestjs/schedule';
 import { id } from '../common/hash.js';
 import { DatabaseService } from '../database/database.service.js';
 import { MarketService } from './market.service.js';
+import { ChipRegistryService } from '../chip-registry/chip-registry.service.js';
 
 describe('MarketService history',()=>{
   let db:DatabaseService;
   let market:MarketService;
-  beforeEach(()=>{db=new DatabaseService(':memory:');db.migrate();market=new MarketService(db)});
+  beforeEach(()=>{db=new DatabaseService(':memory:');db.migrate();market=new MarketService(db,new ChipRegistryService(db),new SchedulerRegistry())});
   afterEach(()=>db.onModuleDestroy());
 
   it('returns real price versions in chronological order',()=>{
@@ -17,6 +19,7 @@ describe('MarketService history',()=>{
     db.raw.prepare('INSERT INTO price_entries VALUES(?,?,?)').run(first,product,250);
     db.raw.prepare('INSERT INTO price_entries VALUES(?,?,?)').run(second,product,275);
 
+    const snap=market.snapshot();expect(snap.snapshot.products[0]).toMatchObject({priceCents:275,version:2,basePriceCents:250});expect(snap.points[snap.points.length-1].prices[product]).toBe(snap.snapshot.products[0].priceCents);
     expect(market.history()).toEqual({points:[
       {version:1,effectiveAt:1000,prices:{[product]:250}},
       {version:2,effectiveAt:2000,prices:{[product]:275}},
@@ -41,9 +44,9 @@ describe('MarketService crash',()=>{
   const actorId='manager-1';
   const priceOf=(p:string)=>(market.list() as any[]).find(x=>x.id===p).priceCents;
   beforeEach(()=>{
-    db=new DatabaseService(':memory:');db.migrate();market=new MarketService(db);
+    db=new DatabaseService(':memory:');db.migrate();market=new MarketService(db,new ChipRegistryService(db),new SchedulerRegistry());
     db.raw.prepare('INSERT INTO users(id,username,password_hash,active,created_at) VALUES(?,?,?,1,?)').run(actorId,'manager','x',Date.now());
-    db.raw.prepare("UPDATE system_state SET mode='NORMAL'").run();
+    db.raw.prepare("UPDATE system_state SET mode='NORMAL',event_phase='OPEN'").run();
     product=id();other=id();
     db.raw.prepare('INSERT INTO products VALUES(?,?,?,?,?,?,1,0)').run(product,'Cola','Alkoholfrei',250,150,400);
     db.raw.prepare('INSERT INTO products VALUES(?,?,?,?,?,?,1,0)').run(other,'Wasser','Alkoholfrei',200,150,300);
@@ -62,6 +65,14 @@ describe('MarketService crash',()=>{
     const state=db.raw.prepare('SELECT crash_until crashUntil,crash_kind crashKind FROM system_state WHERE id=1').get() as any;
     expect(state.crashKind).toBe('CRASH');
     expect(state.crashUntil).toBe(result.crashUntil);
+  });
+
+  it('starts a crash with no human actor (the physical buzzer button) and records its source',()=>{
+    const result=market.startCrash(5,'CRASH',undefined,'physical-buzzer');
+    expect(result.crashKind).toBe('CRASH');
+    const event=db.raw.prepare("SELECT actor_id actorId,payload_json payloadJson FROM audit_events WHERE action='MARKET_CRASH_STARTED'").get() as any;
+    expect(event.actorId).toBeNull();
+    expect(JSON.parse(event.payloadJson).source).toBe('physical-buzzer');
   });
 
   it('keeps forcing the minimum price on every tick while the crash is active',()=>{
@@ -119,9 +130,14 @@ describe('MarketService crash',()=>{
     market.startCrash(1,'CRASH',actorId);
     db.raw.prepare('UPDATE system_state SET crash_until=? WHERE id=1').run(Date.now()-1000);
     market.tick();
-    const activeVersion=db.raw.prepare("SELECT id FROM price_versions WHERE status='ACTIVE'").get() as any;
-    db.raw.prepare("INSERT INTO quotes VALUES(?,?,300,?,'CONSUMED',?,?)").run(id(),activeVersion.id,JSON.stringify([{productId:product,quantity:10}]),Date.now()+30000,Date.now());
+    const activeVersion=db.raw.prepare("SELECT id FROM price_versions WHERE status='ACTIVE'").get() as {id:string};
+    const quote=id(),wallet=id(),op=id(),now=Date.now();
+    db.raw.prepare("INSERT INTO wallets VALUES(?,0,'ACTIVE',0,?)").run(wallet,now);
+    db.raw.prepare("INSERT INTO quotes VALUES(?,?,300,?,'CONSUMED',?,?)").run(quote,activeVersion.id,JSON.stringify([{productId:product,quantity:10}]),now+30000,now-60000);
+    db.raw.prepare("INSERT INTO financial_operations(id,idempotency_key,request_hash,type,status,created_at,committed_at) VALUES(?,?,?,'PURCHASE','COMMITTED',?,?)").run(op,id(),'hash',now,now);
+    db.raw.prepare("INSERT INTO orders VALUES(?,?,?,?,NULL,300,'PAID',?)").run(id(),wallet,quote,op,now);
     market.tick();
     expect(priceOf(product)).toBeGreaterThan(250);
+    const next=market.tick();expect(next.prices.find(p=>p.productId===product)?.demand).toBe(0);
   });
 });

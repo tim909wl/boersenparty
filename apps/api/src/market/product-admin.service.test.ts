@@ -37,6 +37,14 @@ describe('ProductAdminService', () => {
     expect(listed.currentPriceCents).toBe(400);
   });
 
+  it('snaps the live price to an explicitly changed base price rather than clamping to the new max', () => {
+    const created = products.create({ name: 'Bier', category: 'Bier', basePriceCents: 300, minPriceCents: 200, maxPriceCents: 500 }, actorId);
+    const updated = products.update(created.id, { basePriceCents: 150, minPriceCents: 100, maxPriceCents: 250 }, actorId);
+    expect(updated.basePriceCents).toBe(150);
+    const listed = products.list().find(p => p.id === created.id) as any;
+    expect(listed.currentPriceCents).toBe(150);
+  });
+
   it('deactivating a product removes it from the public list query', () => {
     const created = products.create({ name: 'Saisonal', category: 'Test', basePriceCents: 100, minPriceCents: 100, maxPriceCents: 100 }, actorId);
     products.update(created.id, { active: false }, actorId);

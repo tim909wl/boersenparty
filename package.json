@@ -13,7 +13,11 @@
     "import:wristbands": "npm run import:wristbands -w @boersenparty/api",
     "proxy:up": "docker compose up -d lan-proxy",
     "proxy:down": "docker compose down",
-    "proxy:logs": "docker compose logs -f lan-proxy"
+    "proxy:logs": "docker compose logs -f lan-proxy",
+    "lan:build": "docker compose build",
+    "lan:up": "docker compose up -d --build",
+    "lan:check": "bash scripts/check-lan-connectivity.sh",
+    "chips:beacon": "node scripts/chip-discovery-beacon.mjs"
   },
   "devDependencies": {"concurrently": "^9.1.2"},
   "engines": {"node": ">=22"}

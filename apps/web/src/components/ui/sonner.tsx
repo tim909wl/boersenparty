@@ -1,5 +1,9 @@
 import type { ComponentProps, CSSProperties } from 'react';
 import { Toaster as Sonner } from 'sonner';
+// Sonner ships its positioning CSS (position: fixed, placement, stacking, …) as a separate
+// stylesheet rather than injecting it at runtime — without this import the toast list has no
+// layout at all and renders inline wherever <Toaster/> sits in the tree.
+import 'sonner/dist/styles.css';
 
 type ToasterProps = ComponentProps<typeof Sonner>;
 

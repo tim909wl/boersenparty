@@ -18,8 +18,8 @@ app.useGlobalFilters(new ZodExceptionFilter());
 // regenerated on different hardware for the live event).
 app.use(helmet({contentSecurityPolicy:false,hsts:false}));
 app.enableCors({origin:(process.env.CORS_ORIGIN??'http://localhost:5173').split(','),credentials:false});
-app.use((req:any,res:any,next:any)=>{req.correlationId=req.headers['x-correlation-id']??randomUUID();res.setHeader('X-Correlation-Id',req.correlationId);next()});
+app.use((req:any,res:any,next:any)=>{const cid=req.headers['x-correlation-id'];req.correlationId=typeof cid==='string'&&/^[a-zA-Z0-9._-]{1,80}$/.test(cid)?cid:randomUUID();res.setHeader('X-Correlation-Id',req.correlationId);next()});
 app.get(DatabaseService).migrate();
 const doc=SwaggerModule.createDocument(app,new DocumentBuilder().setTitle('Börsenparty API').setVersion('1.0').addBearerAuth().build());
-SwaggerModule.setup('api/docs',app,doc);
+if(process.env.NODE_ENV!=='production'||process.env.ENABLE_SWAGGER==='true')SwaggerModule.setup('api/docs',app,doc);
 await app.listen(Number(process.env.PORT??3000),process.env.API_HOST??'127.0.0.1');

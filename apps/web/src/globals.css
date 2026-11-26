@@ -1,11 +1,49 @@
-/* Tailwind utilities only — preflight is intentionally skipped so this stylesheet (loaded
-   globally for the whole SPA bundle) can never interfere with display.css's hand-tuned,
-   TV-kiosk-safe layout on the /market route. */
-@import "tailwindcss/theme.css" layer(theme);
-@import "tailwindcss/utilities.css" layer(utilities);
+/* Full Tailwind v4 stack, including Preflight. Keeping the reset enabled is essential here:
+   without it browser default margins and form chrome leak into every route and make spacing
+   differ between the POS tablets, mobile browsers and the public display. */
+@import "tailwindcss";
+/* Lets Dialog/AlertDialog/DropdownMenu/Tooltip use data-[state=open]:animate-in etc. — those
+   classes were already written against this plugin but it was never installed, so every open/
+   close transition was silently a no-op (no error, just an instant snap with no animation). */
+@plugin "tailwindcss-animate";
 
 @theme {
-  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  /* Same body font as every other station in the original prototype (loaded via display.css's
+     @font-face, which App.tsx imports at the root — already available on every route). */
+  --font-sans: "BXC", "Barlow Semi Condensed", "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  /* Ticker-board tokens: the /market TV display's own dark trading-floor palette, exposed as
+     Tailwind utilities (bg-ticker-bg, text-ticker-up, font-ticker-display, ...) so that screen
+     can be styled with Tailwind utility classes directly in JSX instead of a hand-written
+     stylesheet, while keeping its exact colors/fonts unchanged from before. */
+  --color-ticker-bg: #0f1216;
+  --color-ticker-panel: #161b21;
+  --color-ticker-line: #20262e;
+  --color-ticker-fg: #f4f6f8;
+  --color-ticker-muted: #8b95a3;
+  --color-ticker-soft: #56606c;
+  --color-ticker-up: #3ddc84;
+  --color-ticker-down: #ff5a5f;
+  --color-ticker-gold: #f2b84b;
+  --font-ticker-display: "BX", "Barlow", "DejaVu Sans", Arial, sans-serif;
+  --font-ticker-body: "BXC", "Barlow Semi Condensed", "DejaVu Sans Condensed", "Arial Narrow", sans-serif;
+  --animate-ticker-up: ticker-roll-up .7s cubic-bezier(.2,.8,.2,1);
+  --animate-ticker-down: ticker-roll-down .7s cubic-bezier(.2,.8,.2,1);
+  --animate-ticker-marquee: ticker-marquee var(--marquee-duration,8s) ease-in-out infinite;
+  --animate-ticker-enter: ticker-enter .7s cubic-bezier(.2,.8,.2,1) both;
+  --animate-ticker-pulse: ticker-pulse 1.6s ease-in-out infinite;
+  --animate-ticker-ring: ticker-ring 1.4s ease-in-out infinite;
+  --animate-ticker-ping: ticker-ping 2.2s ease-out infinite;
+  --animate-ticker-crash-headline: ticker-enter .5s .1s both, ticker-shake .12s .7s 6;
+  /* 90%, not a fixed em: the digits roll in from exactly one price-height below/above and get
+     clipped by the price cell, which is what makes it read as a ticker board flipping over. */
+  @keyframes ticker-roll-up { from { transform: translateY(90%); opacity: 0 } }
+  @keyframes ticker-roll-down { from { transform: translateY(-90%); opacity: 0 } }
+  @keyframes ticker-marquee { 0%,10% { transform: translateX(0) } 45%,55% { transform: translateX(var(--marquee-distance)) } 90%,100% { transform: translateX(0) } }
+  @keyframes ticker-enter { from { transform: translateY(5vh); opacity: 0 } }
+  @keyframes ticker-pulse { 0%,100% { opacity: 1; transform: scale(1) } 50% { opacity: .4; transform: scale(.7) } }
+  @keyframes ticker-ring { 0% { box-shadow: 0 0 0 0 rgba(242,184,75,.5) } 100% { box-shadow: 0 0 0 1.2em rgba(242,184,75,0) } }
+  @keyframes ticker-ping { 0% { transform: scale(.7); opacity: .9 } 100% { transform: scale(1.5); opacity: 0 } }
+  @keyframes ticker-shake { 25% { transform: translate(-.5vw,.3vh) } 75% { transform: translate(.5vw,-.3vh) } }
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   --color-card: var(--card);
@@ -35,41 +73,33 @@
 }
 
 :root{
-  /* Light mode for the whole terminal app (staff-facing, used in a bright setting) — only the
-     /market TV display stays dark, via its own separate display.css palette. The gold accent is
-     kept so it still reads as the same product. */
-  --background:#f7f7f8;
-  --foreground:#16181c;
-  --card:#ffffff;
-  --card-foreground:#16181c;
-  --popover:#ffffff;
-  --popover-foreground:#16181c;
-  --primary:#e2a62e;
+  /* Same dark trading-floor palette as the /market TV display and the original Getränkebörse
+     prototype (--bg/--panel/--panel2/--line/--fg/--muted/--up/--down/--gold) — the whole app now
+     reads as one coherent product instead of a light staff UI next to a dark public board. */
+  --background:#0f1216;
+  --foreground:#f4f6f8;
+  --card:#161b21;
+  --card-foreground:#f4f6f8;
+  --popover:#161b21;
+  --popover-foreground:#f4f6f8;
+  --primary:#f2b84b;
   --primary-foreground:#16120a;
-  --secondary:#eef0f3;
-  --secondary-foreground:#16181c;
-  --muted:#eef0f3;
-  --muted-foreground:#676d76;
-  --accent:#eef0f3;
-  --accent-foreground:#16181c;
-  --destructive:#dc2626;
+  --secondary:#1d232b;
+  --secondary-foreground:#f4f6f8;
+  --muted:#1d232b;
+  --muted-foreground:#8b95a3;
+  --accent:#1d232b;
+  --accent-foreground:#f4f6f8;
+  --destructive:#ff5a5f;
   --destructive-foreground:#ffffff;
-  --success:#15803d;
-  --success-foreground:#ffffff;
-  --border:#e1e3e8;
-  --input:#e1e3e8;
-  --ring:#e2a62e;
+  --success:#3ddc84;
+  --success-foreground:#0f1216;
+  --border:#262d36;
+  --input:#262d36;
+  --ring:#f2b84b;
+  color-scheme:dark;
 }
 
 html,body{height:100%}
-body{font-family:var(--font-sans);-webkit-font-smoothing:antialiased}
+body{margin:0;font-family:var(--font-sans);-webkit-font-smoothing:antialiased}
 *{border-color:var(--color-border)}
-
-/* The terminal app (not /market, which has no native form controls at all) uses raw <button>/
-   <input>/<select> elements styled purely with Tailwind utilities. Without Preflight (skipped
-   above so it can never touch display.css), the browser's own UA chrome — a light button
-   background on macOS/iOS in particular — was showing through. Scoped here instead of a global
-   reset so it stays provably safe for the display. */
-button,input,select,textarea{appearance:none;-webkit-appearance:none;background:transparent;border:0;font:inherit;color:inherit}
-button{cursor:pointer}
-button:disabled{cursor:not-allowed}

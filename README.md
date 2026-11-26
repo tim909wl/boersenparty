@@ -50,14 +50,14 @@ npm run dev
 
 The API is at `http://localhost:3000/api/v1`, Swagger at `http://localhost:3000/api/docs`, and Vite at `http://localhost:5173`. New databases deliberately start in `PAYMENT_STOP`. After the acceptance checklist, an admin changes the mode with `POST /api/v1/operations/mode` and a written reason.
 
-For a display on the same private network, build the web app and start the single-origin proxy:
+For all devices on the same private network, build and start the complete single-origin stack:
 
 ```sh
-npm run build
-npm run proxy:up
+npm run lan:up
+npm run lan:check
 ```
 
-Open `http://SERVER-IP/market` on a Smart TV; port `8080` remains available as a fallback. The current test machine is reachable at `http://192.168.2.190/market`. The API remains bound to localhost; only the proxy ports are exposed. See [docs/NETWORK.md](docs/NETWORK.md) before using another device or changing the router.
+Open `http://SERVER-IP/market` on a Smart TV and `https://SERVER-IP/` on staff terminals. Port `8080` remains available as a display fallback. The current test machine is reachable at `http://192.168.2.190/market` and `https://192.168.2.190/`. The API is available only inside the Docker network; Nginx is the sole LAN-facing service. See [docs/NETWORK.md](docs/NETWORK.md) before using another device or changing the router.
 
 Accepted Excel headers are `Armbandnummer` / `Band_Number` and `UID` / `NFC_UID`. UIDs may contain separators but must normalize to a 4-, 7-, or 10-byte hexadecimal value. The production list should contain exactly 500 valid, unique rows; the importer intentionally does not manufacture missing bands.
 
