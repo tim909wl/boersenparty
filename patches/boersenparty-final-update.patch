@@ -1,0 +1,1517 @@
+diff --git a/apps/api/drizzle/0017_free_drinks.sql b/apps/api/drizzle/0017_free_drinks.sql
+new file mode 100644
+index 0000000..6f9a5ce
+--- /dev/null
++++ b/apps/api/drizzle/0017_free_drinks.sql
+@@ -0,0 +1,14 @@
++-- A free drink is an entitlement, never cash or wallet credit.
++CREATE TABLE free_drink_entitlements (
++ wallet_id TEXT PRIMARY KEY REFERENCES wallets(id),
++ granted_by TEXT NOT NULL REFERENCES users(id),
++ granted_at INTEGER NOT NULL,
++ redeemed_order_id TEXT UNIQUE REFERENCES orders(id),
++ redeemed_at INTEGER,
++ product_id TEXT REFERENCES products(id),
++ original_price_cents INTEGER CHECK(original_price_cents > 0),
++ CHECK ((redeemed_order_id IS NULL AND redeemed_at IS NULL AND product_id IS NULL AND original_price_cents IS NULL) OR (redeemed_order_id IS NOT NULL AND redeemed_at IS NOT NULL AND product_id IS NOT NULL AND original_price_cents IS NOT NULL))
++);
++
++-- Preserve a deliberate emergency stop across a lifecycle rollback.
++ALTER TABLE system_state ADD COLUMN event_resume_mode TEXT NOT NULL DEFAULT 'PAYMENT_STOP' CHECK(event_resume_mode IN('NORMAL','PRICE_FROZEN','PAYMENT_STOP'));
+diff --git a/apps/api/src/database/ledger-integrity.ts b/apps/api/src/database/ledger-integrity.ts
+index 0a5d5fb..ae371fd 100644
+--- a/apps/api/src/database/ledger-integrity.ts
++++ b/apps/api/src/database/ledger-integrity.ts
+@@ -16,6 +16,7 @@ export function ledgerIssues(db: Database.Database): string[] {
+     ['REFUND_POSTINGS', `SELECT 1 FROM refunds r JOIN orders o ON o.id=r.original_order_id JOIN financial_operations f ON f.id=r.operation_id WHERE f.type<>'REFUND' OR f.status<>'COMMITTED' OR (SELECT COUNT(*) FROM ledger_entries e WHERE e.operation_id=f.id)<>2 OR NOT EXISTS(SELECT 1 FROM ledger_entries e JOIN ledger_accounts a ON a.id=e.account_id WHERE e.operation_id=f.id AND a.type='WALLET' AND a.wallet_id=o.wallet_id AND e.amount_cents=r.amount_cents) OR NOT EXISTS(SELECT 1 FROM ledger_entries e JOIN ledger_accounts a ON a.id=e.account_id WHERE e.operation_id=f.id AND a.type='SALES' AND e.amount_cents=-r.amount_cents) LIMIT 1`],
+     ['REFUND_TOTAL', `SELECT 1 FROM orders o LEFT JOIN refunds r ON r.original_order_id=o.id GROUP BY o.id HAVING COALESCE(SUM(r.amount_cents),0)>o.total_cents OR (o.status='REFUNDED' AND COALESCE(SUM(r.amount_cents),0)<>o.total_cents) LIMIT 1`],
+     ['CASH_SESSION',  `SELECT 1 FROM topups t LEFT JOIN cash_session_operations c ON c.operation_id=t.operation_id LEFT JOIN cash_sessions s ON s.id=c.cash_session_id JOIN financial_operations f ON f.id=t.operation_id WHERE t.funding_method='CASH' AND t.status='COMMITTED' AND (c.operation_id IS NULL OR c.amount_cents<>t.amount_cents OR s.terminal_id<>f.terminal_id) LIMIT 1`],
++    ['FREE_DRINK_REDEMPTION', `SELECT 1 FROM free_drink_entitlements f JOIN orders o ON o.id=f.redeemed_order_id WHERE o.wallet_id<>f.wallet_id OR o.total_cents<>0 LIMIT 1`],
+     ['PENDING_OPERATION', `SELECT 1 FROM financial_operations WHERE status='PENDING' LIMIT 1`],
+   ];
+   return checks.filter(([,sql])=>Boolean(db.prepare(sql).get())).map(([name])=>name);
+diff --git a/apps/api/src/finance/finance.controller.ts b/apps/api/src/finance/finance.controller.ts
+index a6dadd2..f5119ae 100644
+--- a/apps/api/src/finance/finance.controller.ts
++++ b/apps/api/src/finance/finance.controller.ts
+@@ -4,4 +4,4 @@ const key=(v:string|undefined)=>{if(!v||v.length<8||v.length>128)throw new Domai
+  @Get('transactions/:key') @Roles('BAR','TOPUP','PAYMENT_LEAD','ADMIN') status(@Param('key') transactionKey:string,@CurrentPrincipal() p:Principal){return this.finance.status(key(transactionKey),p)}
+  @Post('transactions/:key/cancel') @Roles('BAR','TOPUP','PAYMENT_LEAD','ADMIN') cancel(@Param('key') transactionKey:string,@Body() b:unknown,@CurrentPrincipal() p:Principal){const x=z.object({type:z.enum(['TOPUP','PURCHASE'])}).parse(b);if(x.type==='TOPUP'&&!p.roles.some(r=>['TOPUP','PAYMENT_LEAD','ADMIN'].includes(r)))throw new DomainError('TRANSACTION_FORBIDDEN','Keine Aufladeberechtigung',403);if(x.type==='PURCHASE'&&!p.roles.some(r=>['BAR','ADMIN'].includes(r)))throw new DomainError('TRANSACTION_FORBIDDEN','Keine Verkaufsberechtigung',403);return this.finance.cancel(key(transactionKey),x.type,p)}
+  @Post('topups') @Roles('TOPUP','PAYMENT_LEAD','ADMIN') topup(@Body() b:unknown,@Headers('idempotency-key') k:string|undefined,@CurrentPrincipal() p:Principal){const x=z.object({uid:z.string(),amountCents:z.number().int(),fundingMethod:z.enum(['CASH','CARD_VERIFIED']),paymentReference:z.string().min(1).max(200).optional(),expectedWalletId:z.string().min(1).max(80).optional()}).parse(b);return this.finance.topup(x,key(k),p)}
+- @Post('purchases') @Roles('BAR','ADMIN') purchase(@Body() b:unknown,@Headers('idempotency-key') k:string|undefined,@CurrentPrincipal() p:Principal){const x=z.object({uid:z.string(),quoteId:z.string().uuid(),expectedWalletId:z.string().min(1).max(80).optional()}).parse(b);return this.finance.purchase(x,key(k),p)}}
++ @Post('purchases') @Roles('BAR','ADMIN') purchase(@Body() b:unknown,@Headers('idempotency-key') k:string|undefined,@CurrentPrincipal() p:Principal){const x=z.object({uid:z.string(),quoteId:z.string().uuid(),freeDrink:z.literal(true).optional(),expectedWalletId:z.string().min(1).max(80).optional()}).parse(b);return this.finance.purchase(x,key(k),p)}}
+diff --git a/apps/api/src/finance/finance.service.test.ts b/apps/api/src/finance/finance.service.test.ts
+index 9255453..8272366 100644
+--- a/apps/api/src/finance/finance.service.test.ts
++++ b/apps/api/src/finance/finance.service.test.ts
+@@ -42,5 +42,11 @@ describe('FinanceService',()=>{
+   it('refuses new payments before opening',()=>{db.raw.prepare("UPDATE system_state SET event_phase='PREPARING'").run();expect(()=>finance.topup({uid:'0001',amountCents:500,fundingMethod:'CASH'},'event-not-open-key',actor)).toThrow(/Veranstaltung nicht geöffnet/)});
+   it('detects missing wallet account even when ledger entries sum to zero',()=>{db.raw.prepare("DELETE FROM ledger_accounts WHERE type='WALLET'").run();expect(()=>finance.topup({uid:'0001',amountCents:500,fundingMethod:'CASH'},'broken-ledger-key',actor)).toThrow(/Buchhaltung inkonsistent/)});
+   it('rejects replay from a different operator',()=>{const input={uid:'0001',amountCents:500,fundingMethod:'CASH' as const};finance.topup(input,'owner-only-key',actor);expect(()=>finance.topup(input,'owner-only-key',{...actor,sub:'different-user'})).toThrow(/anderen Sitzung/)});
++  it('grants and redeems a free drink exactly once without changing cash or balance',()=>{
++    db.raw.prepare("INSERT INTO user_roles VALUES('user','PAYMENT_LEAD')").run();const w=wallets.lookup('0001');wallets.grantFreeDrink('0001',w.walletId,'user');
++    const product=id(),pv=id(),now=Date.now();db.raw.prepare('INSERT INTO products VALUES(?,?,?,?,?,?,1,0)').run(product,'Bier','Bier',300,200,500);db.raw.prepare("INSERT INTO price_versions VALUES(?,1,'ACTIVE',?,?)").run(pv,now,now);db.raw.prepare('INSERT INTO price_entries VALUES(?,?,300)').run(pv,product);
++    const quote=()=>{const q=id();const active=db.raw.prepare("SELECT id FROM price_versions WHERE status='ACTIVE'").get() as {id:string};db.raw.prepare("INSERT INTO quotes VALUES(?,?,300,?,'OPEN',?,?)").run(q,active.id,JSON.stringify([{productId:product,name:'Bier',quantity:1,unitPriceCents:300}]),now+30000,now);return q;};
++    const input={uid:'0001',quoteId:quote(),expectedWalletId:w.walletId,freeDrink:true as const};const result=finance.purchase(input,'free-drink-1',actor);expect(result).toMatchObject({totalCents:0,balanceCents:0,freeDrink:true});expect(finance.purchase(input,'free-drink-1',actor)).toEqual(result);expect(()=>finance.purchase({...input,quoteId:quote()},'free-drink-2',actor)).toThrow(/Kein Freigetränk/);expect(wallets.grantFreeDrink('0001',w.walletId,'user').freeDrinkStatus).toBe('REDEEMED');
++  });
+   it('reserves a cancelled key and rejects a late payment request without booking money',()=>{const k='cancelled-key-1';expect(finance.cancel(k,'TOPUP',actor).status).toBe('REJECTED');expect(()=>finance.topup({uid:'0001',amountCents:1000,fundingMethod:'CASH'},k,actor)).toThrow(/abgebrochen/);expect(wallets.lookup('0001').balanceCents).toBe(0)});
+ });
+diff --git a/apps/api/src/finance/finance.service.ts b/apps/api/src/finance/finance.service.ts
+index 912298a..cb3dd74 100644
+--- a/apps/api/src/finance/finance.service.ts
++++ b/apps/api/src/finance/finance.service.ts
+@@ -46,10 +46,23 @@ type Actor={sub:string;terminalId:string;roles?:string[]};
+       this.db.raw.prepare("UPDATE financial_operations SET status='COMMITTED',committed_at=?,response_json=? WHERE id=?").run(now,JSON.stringify(response),operationId);appendAudit(this.db.raw,{actorId:actor.sub,action:'TOPUP_COMMITTED',entityType:'financial_operation',entityId:operationId,payload:{walletId:wallet.walletId,amountCents:input.amountCents,fundingMethod:input.fundingMethod,verification:input.fundingMethod==='CARD_VERIFIED'?'MANUAL_CONFIRMATION':'CASH',terminalId:actor.terminalId,balanceBeforeCents:wallet.balanceCents,balanceAfterCents:response.balanceCents,committedAt:now}});return response;
+     }).immediate();
+   }
+-  purchase(input:{uid:string;quoteId:string;expectedWalletId?:string},key:string,actor:Actor){
++  purchase(input:{uid:string;quoteId:string;expectedWalletId?:string;freeDrink?:true},key:string,actor:Actor){
+     const hash=canonicalHash(input),prior=this.replay(key,hash,actor);if(prior)return prior;
+     const response=this.db.raw.transaction(()=>{this.requirePayments();const wallet=this.wallets.lookup(input.uid);if(input.expectedWalletId&&wallet.walletId!==input.expectedWalletId)throw new DomainError('WALLET_CHANGED','Armbandzuordnung hat sich geändert. Neu scannen.',409);const q=this.db.raw.prepare("SELECT * FROM quotes WHERE id=? AND status='OPEN'").get(input.quoteId) as any;
+-      if(!q||q.expires_at<Date.now())throw new DomainError('QUOTE_INVALID','Quote is missing, expired or already used');if(wallet.balanceCents<q.total_cents)throw new DomainError('INSUFFICIENT_FUNDS','Wallet balance is insufficient',422);
++      if(!q||q.expires_at<Date.now())throw new DomainError('QUOTE_INVALID','Quote is missing, expired or already used');
++      const quotedItems=JSON.parse(q.items_json);
++      if(!Array.isArray(quotedItems))throw new DomainError('QUOTE_INVALID','Ungültige Bestellung',422);
++      for(const item of quotedItems){if(item.productId&&!this.db.raw.prepare('SELECT 1 FROM products WHERE id=? AND active=1 AND sold_out=0').get(item.productId))throw new DomainError('PRODUCT_SOLD_OUT','Getränk inzwischen ausverkauft. Bestellung neu prüfen.',422);}
++      let freeProduct:{productId:string;unitPriceCents:number}|undefined;
++      if(input.freeDrink){
++        if(!input.expectedWalletId)throw new DomainError('WALLET_CHANGED','Armband neu scannen',409);
++        if(wallet.freeDrinkStatus!=='AVAILABLE')throw new DomainError('FREE_DRINK_UNAVAILABLE','Kein Freigetränk verfügbar. Bitte Armband neu scannen.',422);
++        const items=JSON.parse(q.items_json);
++        if(!Array.isArray(items)||items.length!==1||items[0].quantity!==1||!Number.isInteger(items[0].unitPriceCents)||items[0].unitPriceCents<=0||items[0].unitPriceCents!==q.total_cents||!this.db.raw.prepare('SELECT 1 FROM products WHERE id=? AND active=1 AND sold_out=0').get(items[0].productId))throw new DomainError('FREE_DRINK_ITEM','Für ein Freigetränk genau ein verfügbares kostenpflichtiges Getränk wählen',422);
++        freeProduct={productId:items[0].productId,unitPriceCents:items[0].unitPriceCents};
++        q.total_cents=0;items[0].unitPriceCents=0;q.items_json=JSON.stringify(items);
++      }
++      if(wallet.balanceCents<q.total_cents)throw new DomainError('INSUFFICIENT_FUNDS','Wallet balance is insufficient',422);
+       const now=Date.now(),operationId=id();
+       this.db.raw.prepare("INSERT INTO financial_operations VALUES(?,?,?,?, 'PENDING',?,?,?,?,NULL)").run(operationId,key,hash,'PURCHASE',actor.terminalId,actor.sub,now,null);
+       // A fixed-price-zero item (e.g. free tap water) has no financial impact, and
+@@ -60,8 +73,9 @@ type Actor={sub:string;terminalId:string;roles?:string[]};
+         this.db.raw.prepare('INSERT INTO ledger_entries VALUES(?,?,?,?,?)').run(id(),operationId,walletAccount.id,-q.total_cents,now);this.db.raw.prepare('INSERT INTO ledger_entries VALUES(?,?,?,?,?)').run(id(),operationId,sales.id,q.total_cents,now);this.assertBalanced(operationId);
+       }
+       const update=this.db.raw.prepare("UPDATE wallets SET balance_cents=balance_cents-?,version=version+1 WHERE id=? AND status='ACTIVE' AND balance_cents>=?").run(q.total_cents,wallet.walletId,q.total_cents);if(update.changes!==1)throw new DomainError('CONCURRENT_BALANCE_CHANGE','Balance changed; retry with a new quote');
+-      this.db.raw.prepare("UPDATE quotes SET status='CONSUMED' WHERE id=?").run(q.id);const orderId=id();this.db.raw.prepare("INSERT INTO orders VALUES(?,?,?,?,?,?, 'PAID',?)").run(orderId,wallet.walletId,q.id,operationId,actor.terminalId,q.total_cents,now);
+-      const result={operationId,orderId,walletId:wallet.walletId,totalCents:q.total_cents,balanceCents:wallet.balanceCents-q.total_cents,status:'COMMITTED'};this.db.raw.prepare("UPDATE financial_operations SET status='COMMITTED',committed_at=?,response_json=? WHERE id=?").run(now,JSON.stringify(result),operationId);appendAudit(this.db.raw,{actorId:actor.sub,action:'PURCHASE_COMMITTED',entityType:'order',entityId:orderId,payload:{operationId,walletId:wallet.walletId,totalCents:q.total_cents,terminalId:actor.terminalId,balanceBeforeCents:wallet.balanceCents,balanceAfterCents:result.balanceCents,committedAt:now}});return result;
++      this.db.raw.prepare("UPDATE quotes SET status='CONSUMED',total_cents=?,items_json=? WHERE id=?").run(q.total_cents,q.items_json,q.id);const orderId=id();this.db.raw.prepare("INSERT INTO orders VALUES(?,?,?,?,?,?, 'PAID',?)").run(orderId,wallet.walletId,q.id,operationId,actor.terminalId,q.total_cents,now);
++      if(freeProduct){const consumed=this.db.raw.prepare('UPDATE free_drink_entitlements SET redeemed_order_id=?,redeemed_at=?,product_id=?,original_price_cents=? WHERE wallet_id=? AND redeemed_order_id IS NULL').run(orderId,now,freeProduct.productId,freeProduct.unitPriceCents,wallet.walletId);if(consumed.changes!==1)throw new DomainError('FREE_DRINK_UNAVAILABLE','Freigetränk bereits eingelöst',409);appendAudit(this.db.raw,{actorId:actor.sub,action:'FREE_DRINK_REDEEMED',entityType:'order',entityId:orderId,payload:{walletId:wallet.walletId,productId:freeProduct.productId,originalPriceCents:freeProduct.unitPriceCents}});}
++      const result={operationId,orderId,freeDrink:Boolean(freeProduct),walletId:wallet.walletId,totalCents:q.total_cents,balanceCents:wallet.balanceCents-q.total_cents,status:'COMMITTED'};this.db.raw.prepare("UPDATE financial_operations SET status='COMMITTED',committed_at=?,response_json=? WHERE id=?").run(now,JSON.stringify(result),operationId);appendAudit(this.db.raw,{actorId:actor.sub,action:'PURCHASE_COMMITTED',entityType:'order',entityId:orderId,payload:{operationId,walletId:wallet.walletId,totalCents:q.total_cents,terminalId:actor.terminalId,balanceBeforeCents:wallet.balanceCents,balanceAfterCents:result.balanceCents,committedAt:now}});return result;
+     }).immediate();
+     // The price engine reacts to demand from completed (paid) sales only — tick it right
+     // after this purchase commits so the market moves immediately in response to payment,
+diff --git a/apps/api/src/market/market.controller.ts b/apps/api/src/market/market.controller.ts
+index 1faf72b..d4f3fbe 100644
+--- a/apps/api/src/market/market.controller.ts
++++ b/apps/api/src/market/market.controller.ts
+@@ -2,7 +2,7 @@ import { timingSafeEqual } from 'node:crypto';
+ import { Body,Controller,Get,Headers,Post } from '@nestjs/common';import { z } from 'zod';import { CurrentPrincipal, Public,Roles,type Principal } from '../auth/auth.js';import { MarketService } from './market.service.js';import { DomainError } from '../common/domain-error.js';
+ // A plain crash is meant as a short, loud moment at the bar; the drawn-out variant is AUSVERKAUF.
+ export const CRASH_DEFAULT_MINUTES=2;
+-@Controller()export class MarketController{constructor(private market:MarketService){} @Public() @Get('products')products(){return this.market.list()} @Public() @Get('market/history')history(){return this.market.history()} @Post('quotes')@Roles('BAR','ADMIN')quote(@Body()b:unknown){return this.market.quote(z.object({items:z.array(z.object({productId:z.string().uuid(),quantity:z.number().int()})).min(1).max(20)}).parse(b).items)} @Post('market/tick')@Roles('MARKET_MANAGER','ADMIN')tick(){return this.market.tick()} @Post('market/crash')@Roles('MARKET_MANAGER','ADMIN')crash(@Body()b:unknown,@CurrentPrincipal()p:Principal){const x=z.object({minutes:z.number().int().min(1).max(30),kind:z.enum(['CRASH','AUSVERKAUF']).default('CRASH')}).parse(b);return this.market.startCrash(x.minutes,x.kind,p.sub)} @Post('market/crash/stop')@Roles('MARKET_MANAGER','ADMIN')stopCrash(@CurrentPrincipal()p:Principal){return this.market.stopCrash(p.sub)}
++@Controller()export class MarketController{constructor(private market:MarketService){} @Public() @Get('products')products(){return this.market.list()} @Public() @Get('market/history')history(){return this.market.snapshot()} @Post('quotes')@Roles('BAR','ADMIN')quote(@Body()b:unknown){return this.market.quote(z.object({items:z.array(z.object({productId:z.string().uuid(),quantity:z.number().int()})).min(1).max(20)}).parse(b).items)} @Post('market/tick')@Roles('MARKET_MANAGER','ADMIN')tick(){return this.market.tick()} @Post('market/crash')@Roles('MARKET_MANAGER','ADMIN')crash(@Body()b:unknown,@CurrentPrincipal()p:Principal){const x=z.object({minutes:z.number().int().min(1).max(30),kind:z.enum(['CRASH','AUSVERKAUF']).default('CRASH')}).parse(b);return this.market.startCrash(x.minutes,x.kind,p.sub)} @Post('market/crash/stop')@Roles('MARKET_MANAGER','ADMIN')stopCrash(@CurrentPrincipal()p:Principal){return this.market.stopCrash(p.sub)}
+  // Physical crash button (ESP32 + buzzer): no staff login, just a shared secret header — kept
+  // deliberately separate from the staff-facing /market/crash endpoint above so the hardware
+  // integration never needs a user account or JWT refresh logic.
+diff --git a/apps/api/src/market/market.service.test.ts b/apps/api/src/market/market.service.test.ts
+index 2260f74..673600b 100644
+--- a/apps/api/src/market/market.service.test.ts
++++ b/apps/api/src/market/market.service.test.ts
+@@ -19,6 +19,7 @@ describe('MarketService history',()=>{
+     db.raw.prepare('INSERT INTO price_entries VALUES(?,?,?)').run(first,product,250);
+     db.raw.prepare('INSERT INTO price_entries VALUES(?,?,?)').run(second,product,275);
+ 
++    const snap=market.snapshot();expect(snap.snapshot.products[0]).toMatchObject({priceCents:275,version:2,basePriceCents:250});expect(snap.points[snap.points.length-1].prices[product]).toBe(snap.snapshot.products[0].priceCents);
+     expect(market.history()).toEqual({points:[
+       {version:1,effectiveAt:1000,prices:{[product]:250}},
+       {version:2,effectiveAt:2000,prices:{[product]:275}},
+@@ -45,7 +46,7 @@ describe('MarketService crash',()=>{
+   beforeEach(()=>{
+     db=new DatabaseService(':memory:');db.migrate();market=new MarketService(db,new ChipRegistryService(db),new SchedulerRegistry());
+     db.raw.prepare('INSERT INTO users(id,username,password_hash,active,created_at) VALUES(?,?,?,1,?)').run(actorId,'manager','x',Date.now());
+-    db.raw.prepare("UPDATE system_state SET mode='NORMAL'").run();
++    db.raw.prepare("UPDATE system_state SET mode='NORMAL',event_phase='OPEN'").run();
+     product=id();other=id();
+     db.raw.prepare('INSERT INTO products VALUES(?,?,?,?,?,?,1,0)').run(product,'Cola','Alkoholfrei',250,150,400);
+     db.raw.prepare('INSERT INTO products VALUES(?,?,?,?,?,?,1,0)').run(other,'Wasser','Alkoholfrei',200,150,300);
+diff --git a/apps/api/src/market/market.service.ts b/apps/api/src/market/market.service.ts
+index e9edd1f..1ff7b7d 100644
+--- a/apps/api/src/market/market.service.ts
++++ b/apps/api/src/market/market.service.ts
+@@ -25,13 +25,14 @@ const CRASH_END_TIMEOUT_NAME='crash-end';
+   this.scheduler.addTimeout(CRASH_END_TIMEOUT_NAME,timeout);
+  }
+  private cancelScheduledCrashEnd(){try{this.scheduler.deleteTimeout(CRASH_END_TIMEOUT_NAME)}catch{}}
+- list(){return this.db.raw.prepare(`SELECT p.id,p.name,p.category,pe.price_cents priceCents,p.min_price_cents minPriceCents,p.max_price_cents maxPriceCents,p.sold_out soldOut,pv.version FROM products p JOIN price_versions pv ON pv.status='ACTIVE' JOIN price_entries pe ON pe.price_version_id=pv.id AND pe.product_id=p.id WHERE p.active=1 ORDER BY p.category,p.name`).all().map((x:any)=>({...x,soldOut:Boolean(x.soldOut)}))}
++ list(){return this.db.raw.prepare(`SELECT p.id,p.name,p.category,pe.price_cents priceCents,p.base_price_cents basePriceCents,p.min_price_cents minPriceCents,p.max_price_cents maxPriceCents,p.sold_out soldOut,pv.version FROM products p JOIN price_versions pv ON pv.status='ACTIVE' JOIN price_entries pe ON pe.price_version_id=pv.id AND pe.product_id=p.id WHERE p.active=1 ORDER BY p.category,p.name`).all().map((x:any)=>({...x,soldOut:Boolean(x.soldOut)}))}
++ snapshot(){return this.db.raw.transaction(()=>({...this.history(),snapshot:{products:this.list(),health:this.health(),serverTime:Date.now()}}))()}
+  history(){const rows=this.db.raw.prepare(`SELECT pv.version,pv.effective_at effectiveAt,p.id productId,pe.price_cents priceCents FROM (SELECT id,version,effective_at FROM price_versions ORDER BY version DESC LIMIT 60) pv JOIN price_entries pe ON pe.price_version_id=pv.id JOIN products p ON p.id=pe.product_id AND p.active=1 ORDER BY pv.version ASC,p.name ASC`).all() as any[];const points=new Map<number,{version:number;effectiveAt:number;prices:Record<string,number>}>();for(const row of rows){let point=points.get(row.version);if(!point){point={version:row.version,effectiveAt:row.effectiveAt,prices:{}};points.set(row.version,point)}point.prices[row.productId]=row.priceCents}return{points:[...points.values()]}}
+- isRunning(){return (this.db.raw.prepare('SELECT mode FROM system_state WHERE id=1').get() as any)?.mode==='NORMAL'}
++ isRunning(){const s=this.db.raw.prepare('SELECT mode,event_phase FROM system_state WHERE id=1').get() as any;return s?.mode==='NORMAL'&&s.event_phase==='OPEN'}
+  quote(items:Item[]){if(!items.length)throw new DomainError('EMPTY_CART','Cart is empty',400);const version=this.db.raw.prepare("SELECT id,version FROM price_versions WHERE status='ACTIVE'").get() as any;if(!version)throw new DomainError('NO_ACTIVE_PRICES','No active price version',503);let total=0;const priced=items.map(i=>{if(!Number.isInteger(i.quantity)||i.quantity<1||i.quantity>20)throw new DomainError('INVALID_QUANTITY','Quantity must be 1-20',400);const p=this.db.raw.prepare('SELECT p.name,p.sold_out soldOut,pe.price_cents price FROM price_entries pe JOIN products p ON p.id=pe.product_id WHERE pe.price_version_id=? AND p.id=? AND p.active=1').get(version.id,i.productId) as any;if(!p)throw new DomainError('PRODUCT_UNAVAILABLE','Product unavailable',422);if(p.soldOut)throw new DomainError('PRODUCT_SOLD_OUT',`${p.name} ist ausverkauft`,422);total+=p.price*i.quantity;return {...i,name:p.name,unitPriceCents:p.price}});const quoteId=id(),now=Date.now(),expiresAt=now+30_000;this.db.raw.prepare("INSERT INTO quotes VALUES(?,?,?,?, 'OPEN',?,?)").run(quoteId,version.id,total,JSON.stringify(priced),expiresAt,now);return{quoteId,priceVersion:version.version,totalCents:total,items:priced,expiresAt}}
+  setMode(mode:'NORMAL'|'PRICE_FROZEN'|'PAYMENT_STOP',reason:string,actorId:string){if(reason.trim().length<5)throw new DomainError('REASON_REQUIRED','Operational mode changes require a reason',400);return this.db.raw.transaction(()=>{if(mode==='NORMAL'){const state=this.db.raw.prepare('SELECT event_phase phase FROM system_state WHERE id=1').get() as any;if(state?.phase!=='OPEN')throw new DomainError('EVENT_NOT_OPEN','Veranstaltung nicht geöffnet',422);assertLedgerReady(this.db.raw)}const previous=(this.db.raw.prepare('SELECT mode FROM system_state WHERE id=1').get() as any)?.mode;this.db.raw.prepare('UPDATE system_state SET mode=?,changed_at=?,changed_by=?,reason=? WHERE id=1').run(mode,Date.now(),actorId,reason.trim());appendAudit(this.db.raw,{actorId,action:'SYSTEM_MODE_CHANGED',entityType:'system_state',entityId:'1',payload:{previous,mode,reason:reason.trim()}});return{mode,reason:reason.trim()}}).immediate()}
+- tick(){return this.db.raw.transaction(()=>{const state=this.db.raw.prepare('SELECT mode,crash_until crashUntil FROM system_state WHERE id=1').get() as any;if(state.mode!=='NORMAL')throw new DomainError('MARKET_NOT_RUNNING','Price engine only runs in NORMAL mode');const current=this.db.raw.prepare("SELECT id,version,effective_at FROM price_versions WHERE status='ACTIVE'").get() as any;if(!current)throw new DomainError('NO_ACTIVE_PRICES','No active price version',503);const now=Date.now(),crashing=state.crashUntil>now,justEnded=!crashing&&state.crashUntil>0;const products=this.db.raw.prepare('SELECT p.*,pe.price_cents current FROM products p JOIN price_entries pe ON pe.product_id=p.id WHERE pe.price_version_id=? AND p.active=1').all(current.id) as any[];const demand=new Map<string,number>();if(!crashing&&!justEnded)for(const row of this.db.raw.prepare("SELECT items_json FROM quotes WHERE status='CONSUMED' AND created_at>=?").all(current.effective_at) as any[])for(const item of JSON.parse(row.items_json))demand.set(item.productId,(demand.get(item.productId)??0)+item.quantity);const average=products.reduce((n,p)=>n+(demand.get(p.id)??0),0)/Math.max(1,products.length),nextId=id();this.db.raw.prepare("UPDATE price_versions SET status='SUPERSEDED' WHERE id=?").run(current.id);this.db.raw.prepare("INSERT INTO price_versions VALUES(?,?,'ACTIVE',?,?)").run(nextId,current.version+1,now,now);const prices=products.map(p=>{let price:number;if(crashing)price=p.min_price_cents;else if(justEnded)price=p.base_price_cents;else{const delta=(demand.get(p.id)??0)-average,step=Math.round(p.base_price_cents*0.05),direction=delta>0.5?1:delta<-.5?-1:0;price=Math.max(p.min_price_cents,Math.min(p.max_price_cents,p.current+direction*step))}this.db.raw.prepare('INSERT INTO price_entries VALUES(?,?,?)').run(nextId,p.id,price);return{productId:p.id,priceCents:price,demand:demand.get(p.id)??0}});if(justEnded){this.db.raw.prepare('UPDATE system_state SET crash_until=0,crash_kind=NULL WHERE id=1').run();this.chips.setLightsForCapableChips(false)}return{version:current.version+1,effectiveAt:now,prices}}).immediate()}
+- startCrash(minutes:number,kind:'CRASH'|'AUSVERKAUF',actorId?:string,source?:string){if(!Number.isInteger(minutes)||minutes<1||minutes>30)throw new DomainError('INVALID_DURATION','Crash duration must be between 1 and 30 minutes',400);return this.db.raw.transaction(()=>{const state=this.db.raw.prepare('SELECT mode,crash_until crashUntil FROM system_state WHERE id=1').get() as any;if(state.mode!=='NORMAL')throw new DomainError('MARKET_NOT_RUNNING','A crash can only be started while the market is running',409);const now=Date.now();if(state.crashUntil>now)throw new DomainError('CRASH_ALREADY_ACTIVE','A crash or sale is already running',409);const current=this.db.raw.prepare("SELECT id,version FROM price_versions WHERE status='ACTIVE'").get() as any;if(!current)throw new DomainError('NO_ACTIVE_PRICES','No active price version',503);const products=this.db.raw.prepare('SELECT p.id,p.min_price_cents FROM products p JOIN price_entries pe ON pe.product_id=p.id WHERE pe.price_version_id=? AND p.active=1').all(current.id) as any[];const until=now+minutes*60000,nextId=id();this.db.raw.prepare("UPDATE price_versions SET status='SUPERSEDED' WHERE id=?").run(current.id);this.db.raw.prepare("INSERT INTO price_versions VALUES(?,?,'ACTIVE',?,?)").run(nextId,current.version+1,now,now);for(const p of products)this.db.raw.prepare('INSERT INTO price_entries VALUES(?,?,?)').run(nextId,p.id,p.min_price_cents);this.db.raw.prepare('UPDATE system_state SET crash_until=?,crash_kind=? WHERE id=1').run(until,kind);this.chips.setLightsForCapableChips(true);appendAudit(this.db.raw,{actorId,action:'MARKET_CRASH_STARTED',entityType:'system_state',entityId:'1',payload:{minutes,kind,source:source??'staff'}});this.scheduleCrashEnd(until,minutes*60000);return{crashUntil:until,crashKind:kind,version:current.version+1}}).immediate()}
++ tick(){return this.db.raw.transaction(()=>{const state=this.db.raw.prepare('SELECT mode,event_phase,crash_until crashUntil FROM system_state WHERE id=1').get() as any;if(state.mode!=='NORMAL'||state.event_phase!=='OPEN')throw new DomainError('MARKET_NOT_RUNNING','Price engine only runs in NORMAL mode');const current=this.db.raw.prepare("SELECT id,version,effective_at FROM price_versions WHERE status='ACTIVE'").get() as any;if(!current)throw new DomainError('NO_ACTIVE_PRICES','No active price version',503);const now=Date.now(),crashing=state.crashUntil>now,justEnded=!crashing&&state.crashUntil>0;const products=this.db.raw.prepare('SELECT p.*,pe.price_cents current FROM products p JOIN price_entries pe ON pe.product_id=p.id WHERE pe.price_version_id=? AND p.active=1').all(current.id) as any[];const demand=new Map<string,number>();if(!crashing&&!justEnded)for(const row of this.db.raw.prepare("SELECT items_json FROM quotes WHERE status='CONSUMED' AND created_at>=?").all(current.effective_at) as any[])for(const item of JSON.parse(row.items_json))demand.set(item.productId,(demand.get(item.productId)??0)+item.quantity);const average=products.reduce((n,p)=>n+(demand.get(p.id)??0),0)/Math.max(1,products.length),nextId=id();this.db.raw.prepare("UPDATE price_versions SET status='SUPERSEDED' WHERE id=?").run(current.id);this.db.raw.prepare("INSERT INTO price_versions VALUES(?,?,'ACTIVE',?,?)").run(nextId,current.version+1,now,now);const prices=products.map(p=>{let price:number;if(crashing)price=p.min_price_cents;else if(justEnded)price=p.base_price_cents;else{const delta=(demand.get(p.id)??0)-average,step=Math.round(p.base_price_cents*0.05),direction=delta>0.5?1:delta<-.5?-1:0;price=Math.max(p.min_price_cents,Math.min(p.max_price_cents,p.current+direction*step))}this.db.raw.prepare('INSERT INTO price_entries VALUES(?,?,?)').run(nextId,p.id,price);return{productId:p.id,priceCents:price,demand:demand.get(p.id)??0}});if(justEnded){this.db.raw.prepare('UPDATE system_state SET crash_until=0,crash_kind=NULL WHERE id=1').run();this.chips.setLightsForCapableChips(false)}return{version:current.version+1,effectiveAt:now,prices}}).immediate()}
++ startCrash(minutes:number,kind:'CRASH'|'AUSVERKAUF',actorId?:string,source?:string){if(!Number.isInteger(minutes)||minutes<1||minutes>30)throw new DomainError('INVALID_DURATION','Crash duration must be between 1 and 30 minutes',400);return this.db.raw.transaction(()=>{const state=this.db.raw.prepare('SELECT mode,event_phase,crash_until crashUntil FROM system_state WHERE id=1').get() as any;if(state.mode!=='NORMAL'||state.event_phase!=='OPEN')throw new DomainError('MARKET_NOT_RUNNING','A crash can only be started while the market is running',409);const now=Date.now();if(state.crashUntil>now)throw new DomainError('CRASH_ALREADY_ACTIVE','A crash or sale is already running',409);const current=this.db.raw.prepare("SELECT id,version FROM price_versions WHERE status='ACTIVE'").get() as any;if(!current)throw new DomainError('NO_ACTIVE_PRICES','No active price version',503);const products=this.db.raw.prepare('SELECT p.id,p.min_price_cents FROM products p JOIN price_entries pe ON pe.product_id=p.id WHERE pe.price_version_id=? AND p.active=1').all(current.id) as any[];const until=now+minutes*60000,nextId=id();this.db.raw.prepare("UPDATE price_versions SET status='SUPERSEDED' WHERE id=?").run(current.id);this.db.raw.prepare("INSERT INTO price_versions VALUES(?,?,'ACTIVE',?,?)").run(nextId,current.version+1,now,now);for(const p of products)this.db.raw.prepare('INSERT INTO price_entries VALUES(?,?,?)').run(nextId,p.id,p.min_price_cents);this.db.raw.prepare('UPDATE system_state SET crash_until=?,crash_kind=? WHERE id=1').run(until,kind);this.chips.setLightsForCapableChips(true);appendAudit(this.db.raw,{actorId,action:'MARKET_CRASH_STARTED',entityType:'system_state',entityId:'1',payload:{minutes,kind,source:source??'staff'}});this.scheduleCrashEnd(until,minutes*60000);return{crashUntil:until,crashKind:kind,version:current.version+1}}).immediate()}
+  stopCrash(actorId:string){const state=this.db.raw.prepare('SELECT crash_until crashUntil FROM system_state WHERE id=1').get() as any;if(state.crashUntil<=Date.now())throw new DomainError('NOT_CRASHING','No crash or sale is currently active',409);this.cancelScheduledCrashEnd();return this.finishCrash(actorId,'staff')}
+  health(){const state=this.db.raw.prepare('SELECT mode,changed_at changedAt,reason,crash_until crashUntil,crash_kind crashKind,diagnostics_requested_at diagnosticsRequestedAt,event_phase eventPhase,event_name eventName FROM system_state WHERE id=1').get();const issues=ledgerIssues(this.db.raw);return{ok:issues.length===0,state,ledgerBalanced:issues.length===0,integrityIssues:issues,database:'ok'}}
+ }
+diff --git a/apps/api/src/operations/cash-session.service.test.ts b/apps/api/src/operations/cash-session.service.test.ts
+index f6e436f..41f429f 100644
+--- a/apps/api/src/operations/cash-session.service.test.ts
++++ b/apps/api/src/operations/cash-session.service.test.ts
+@@ -1,2 +1,6 @@
+ import { afterEach,beforeEach,describe,expect,it } from 'vitest';import { DatabaseService } from '../database/database.service.js';import { CashSessionService } from './cash-session.service.js';
+-describe('CashSessionService',()=>{let db:DatabaseService,cash:CashSessionService;const actor={sub:'user',terminalId:'terminal'};beforeEach(()=>{db=new DatabaseService(':memory:');db.migrate();const now=Date.now();db.raw.prepare('INSERT INTO users(id,username,password_hash,active,created_at) VALUES(?,?,?,1,?)').run('user','u','x',now);db.raw.prepare("INSERT INTO terminals VALUES('terminal','T','CENTRAL','ACTIVE',?)").run(now);cash=new CashSessionService(db)});afterEach(()=>db.onModuleDestroy());it('opens and reconciles a matching till',()=>{cash.open(10000,actor);const closed=cash.close(10000,undefined,actor);expect(closed.differenceCents).toBe(0);expect(cash.current('terminal')).toBeNull()});it('requires an explanation for a cash difference',()=>{cash.open(10000,actor);expect(()=>cash.close(9900,undefined,actor)).toThrow(/requires a reason/);expect(cash.close(9900,'One euro short',actor).differenceCents).toBe(-100)})});
++describe('CashSessionService',()=>{let db:DatabaseService,cash:CashSessionService;const actor={sub:'user',terminalId:'terminal'};beforeEach(()=>{db=new DatabaseService(':memory:');db.migrate();const now=Date.now();db.raw.prepare('INSERT INTO users(id,username,password_hash,active,created_at) VALUES(?,?,?,1,?)').run('user','u','x',now);db.raw.prepare("INSERT INTO terminals VALUES('terminal','T','CENTRAL','ACTIVE',?)").run(now);cash=new CashSessionService(db)});afterEach(()=>db.onModuleDestroy());it('opens and reconciles a matching till',()=>{cash.open(10000,actor);const closed=cash.close(10000,undefined,actor);expect(closed.differenceCents).toBe(0);expect(cash.current('terminal')).toBeNull()});it('requires an explanation for a cash difference',()=>{cash.open(10000,actor);expect(()=>cash.close(9900,undefined,actor)).toThrow(/requires a reason/);expect(cash.close(9900,'One euro short',actor).differenceCents).toBe(-100)});
++ it('lists all tills, rejects cross-terminal staff and allows leadership',()=>{const own=cash.open(0,actor)!;db.raw.prepare("INSERT INTO terminals VALUES('other','Other','ADMIN','ACTIVE',?)").run(Date.now());const remote={...actor,terminalId:'other'};const second=cash.open(100,remote)!;expect(cash.listOpen()).toHaveLength(2);expect(()=>cash.close(100,undefined,actor,second.id,100)).toThrow(/Berechtigung/);db.raw.prepare("INSERT INTO user_roles VALUES('user','ADMIN')").run();expect(cash.close(100,undefined,actor,second.id,100).differenceCents).toBe(0);expect(cash.current('terminal')?.id).toBe(own.id)});
++ it('rejects stale counts and stale session IDs',()=>{const old=cash.open(100,actor)!;expect(()=>cash.close(100,undefined,actor,old.id,0)).toThrow(/Sollbestand/);cash.close(100,undefined,actor,old.id,100);const next=cash.open(0,actor)!;expect(()=>cash.close(0,undefined,actor,old.id,100)).toThrow(/no open cash session/);expect(cash.current('terminal')?.id).toBe(next.id)});
++ it('forbids new tills in closing or closed phase',()=>{for(const phase of ['CLOSING','CLOSED']){db.raw.prepare('UPDATE system_state SET event_phase=? WHERE id=1').run(phase);expect(()=>cash.open(0,actor)).toThrow(/keine Kasse/)}expect(cash.listOpen()).toHaveLength(0)});
++});
+diff --git a/apps/api/src/operations/cash-session.service.ts b/apps/api/src/operations/cash-session.service.ts
+index ab62475..dd0c842 100644
+--- a/apps/api/src/operations/cash-session.service.ts
++++ b/apps/api/src/operations/cash-session.service.ts
+@@ -1,3 +1,6 @@
+ import { Injectable } from '@nestjs/common';import { DatabaseService } from '../database/database.service.js';import { DomainError } from '../common/domain-error.js';import { id } from '../common/hash.js';import { appendAudit } from '../common/audit.js';
+ type Actor={sub:string;terminalId:string};
+-@Injectable()export class CashSessionService{constructor(private db:DatabaseService){}current(terminalId:string){return this.db.raw.prepare(`SELECT cs.id,cs.terminal_id terminalId,cs.operator_id operatorId,cs.opened_at openedAt,cs.opening_cash_cents openingCashCents,COALESCE(SUM(cso.amount_cents),0) movementsCents,cs.opening_cash_cents+COALESCE(SUM(cso.amount_cents),0) expectedCashCents FROM cash_sessions cs LEFT JOIN cash_session_operations cso ON cso.cash_session_id=cs.id WHERE cs.terminal_id=? AND cs.status='OPEN' GROUP BY cs.id`).get(terminalId)??null}open(openingCashCents:number,actor:Actor){if(!Number.isInteger(openingCashCents)||openingCashCents<0||openingCashCents>100000)throw new DomainError('INVALID_OPENING_CASH','Opening cash must be 0-1000 EUR',400);return this.db.raw.transaction(()=>{if(this.current(actor.terminalId))throw new DomainError('CASH_SESSION_ALREADY_OPEN','This terminal already has an open cash session');const sessionId=id(),now=Date.now();this.db.raw.prepare("INSERT INTO cash_sessions(id,terminal_id,operator_id,opened_at,opening_cash_cents,status) VALUES(?,?,?,?,?,'OPEN')").run(sessionId,actor.terminalId,actor.sub,now,openingCashCents);appendAudit(this.db.raw,{actorId:actor.sub,action:'CASH_SESSION_OPENED',entityType:'cash_session',entityId:sessionId,payload:{terminalId:actor.terminalId,openingCashCents}});return this.current(actor.terminalId)}).immediate()}close(countedCashCents:number,reason:string|undefined,actor:Actor){if(!Number.isInteger(countedCashCents)||countedCashCents<0||countedCashCents>1000000)throw new DomainError('INVALID_COUNTED_CASH','Counted cash must be 0-10000 EUR',400);return this.db.raw.transaction(()=>{const current=this.current(actor.terminalId) as any;if(!current)throw new DomainError('NO_OPEN_CASH_SESSION','This terminal has no open cash session',404);const difference=countedCashCents-current.expectedCashCents;if(difference!==0&&(!reason||reason.trim().length<5))throw new DomainError('DIFFERENCE_REASON_REQUIRED','A cash difference requires a reason',400);const now=Date.now();this.db.raw.prepare("UPDATE cash_sessions SET closed_at=?,counted_cash_cents=?,expected_cash_cents=?,difference_cents=?,status='CLOSED',close_reason=? WHERE id=? AND status='OPEN'").run(now,countedCashCents,current.expectedCashCents,difference,reason?.trim()??null,current.id);appendAudit(this.db.raw,{actorId:actor.sub,action:'CASH_SESSION_CLOSED',entityType:'cash_session',entityId:current.id,payload:{terminalId:actor.terminalId,expectedCashCents:current.expectedCashCents,countedCashCents,differenceCents:difference,reason:reason?.trim()??null}});return{sessionId:current.id,status:'CLOSED',expectedCashCents:current.expectedCashCents,countedCashCents,differenceCents:difference}}).immediate()}}
++export type OpenCashSession={id:string;terminalId:string;terminalName:string;operatorId:string;operatorName:string;openedAt:number;openingCashCents:number;movementsCents:number;expectedCashCents:number};
++@Injectable()export class CashSessionService{constructor(private db:DatabaseService){}listOpen():OpenCashSession[]{return this.db.raw.prepare(`SELECT cs.id,cs.terminal_id terminalId,t.name terminalName,cs.operator_id operatorId,u.username operatorName,cs.opened_at openedAt,cs.opening_cash_cents openingCashCents,COALESCE(SUM(cso.amount_cents),0) movementsCents,cs.opening_cash_cents+COALESCE(SUM(cso.amount_cents),0) expectedCashCents FROM cash_sessions cs JOIN terminals t ON t.id=cs.terminal_id JOIN users u ON u.id=cs.operator_id LEFT JOIN cash_session_operations cso ON cso.cash_session_id=cs.id WHERE cs.status='OPEN' GROUP BY cs.id ORDER BY t.name,cs.opened_at`).all() as OpenCashSession[]}
++current(terminalId:string):OpenCashSession|null{return this.listOpen().find(s=>s.terminalId===terminalId)??null}
++open(openingCashCents:number,actor:Actor){if(!Number.isInteger(openingCashCents)||openingCashCents<0||openingCashCents>100000)throw new DomainError('INVALID_OPENING_CASH','Opening cash must be 0-1000 EUR',400);return this.db.raw.transaction(()=>{const phase=(this.db.raw.prepare('SELECT event_phase FROM system_state WHERE id=1').get() as {event_phase:string}|undefined)?.event_phase;if(phase!=='OPEN'&&phase!=='PREPARING')throw new DomainError('CASH_OPEN_FORBIDDEN','Während oder nach dem Abschluss kann keine Kasse eröffnet werden',422);if(this.current(actor.terminalId))throw new DomainError('CASH_SESSION_ALREADY_OPEN','This terminal already has an open cash session');const sessionId=id(),now=Date.now();this.db.raw.prepare("INSERT INTO cash_sessions(id,terminal_id,operator_id,opened_at,opening_cash_cents,status) VALUES(?,?,?,?,?,'OPEN')").run(sessionId,actor.terminalId,actor.sub,now,openingCashCents);appendAudit(this.db.raw,{actorId:actor.sub,action:'CASH_SESSION_OPENED',entityType:'cash_session',entityId:sessionId,payload:{terminalId:actor.terminalId,openingCashCents}});return this.current(actor.terminalId)}).immediate()}close(countedCashCents:number,reason:string|undefined,actor:Actor,sessionId?:string,expectedCashCents?:number){if(!Number.isInteger(countedCashCents)||countedCashCents<0||countedCashCents>1000000)throw new DomainError('INVALID_COUNTED_CASH','Counted cash must be 0-10000 EUR',400);return this.db.raw.transaction(()=>{const current=sessionId?this.listOpen().find(s=>s.id===sessionId):this.current(actor.terminalId);if(current&&current.terminalId!==actor.terminalId&&!this.db.raw.prepare("SELECT 1 FROM user_roles WHERE user_id=? AND role IN('ADMIN','PAYMENT_LEAD')").get(actor.sub))throw new DomainError('CASH_FORBIDDEN','Keine Berechtigung für fremde Kassen',403);if(current&&expectedCashCents!==undefined&&current.expectedCashCents!==expectedCashCents)throw new DomainError('CASH_CHANGED','Der Sollbestand hat sich geändert. Bitte Kasse erneut zählen.',409);if(!current)throw new DomainError('NO_OPEN_CASH_SESSION','This terminal has no open cash session',404);const difference=countedCashCents-current.expectedCashCents;if(difference!==0&&(!reason||reason.trim().length<5))throw new DomainError('DIFFERENCE_REASON_REQUIRED','A cash difference requires a reason',400);const now=Date.now();this.db.raw.prepare("UPDATE cash_sessions SET closed_at=?,counted_cash_cents=?,expected_cash_cents=?,difference_cents=?,status='CLOSED',close_reason=? WHERE id=? AND status='OPEN'").run(now,countedCashCents,current.expectedCashCents,difference,reason?.trim()??null,current.id);appendAudit(this.db.raw,{actorId:actor.sub,action:'CASH_SESSION_CLOSED',entityType:'cash_session',entityId:current.id,payload:{terminalId:current.terminalId,closingTerminalId:actor.terminalId,openingOperatorId:current.operatorId,expectedCashCents:current.expectedCashCents,countedCashCents,differenceCents:difference,reason:reason?.trim()??null}});return{sessionId:current.id,status:'CLOSED',expectedCashCents:current.expectedCashCents,countedCashCents,differenceCents:difference}}).immediate()}}
+diff --git a/apps/api/src/operations/event.service.test.ts b/apps/api/src/operations/event.service.test.ts
+index f05d2ce..0b85b89 100644
+--- a/apps/api/src/operations/event.service.test.ts
++++ b/apps/api/src/operations/event.service.test.ts
+@@ -51,9 +51,14 @@ describe('EventService', () => {
+     expect(() => events.close('user-0')).toThrow(/Kassensitzung/);
+ 
+     db.raw.prepare("UPDATE cash_sessions SET status='CLOSED'").run();
++    expect(()=>events.close('user-0')).toThrow(/nicht vollständig abgerechnet/);
++    db.raw.prepare("UPDATE cash_sessions SET closed_at=?,counted_cash_cents=0,expected_cash_cents=0,difference_cents=0").run(now);
+     expect(events.close('user-0').phase).toBe('CLOSED');
+   });
+ 
++  it('supports a safe step back while preserving an existing emergency stop',()=>{
++    addStaff(2);addProduct();new WristbandImportService(db).importRows([{bandNumber:'0001',uid:'04A1B2C3D4E5F6'}]);events.open('Börsenparty','user-0');expect(events.stepBack('OPEN','user-0').phase).toBe('PREPARING');events.open('Börsenparty','user-0');const opened=events.state().openedAt;db.raw.prepare("UPDATE system_state SET mode='PAYMENT_STOP'").run();events.beginClosing('user-0');events.close('user-0');expect(events.stepBack('CLOSED','user-0').phase).toBe('CLOSING');expect(events.stepBack('CLOSING','user-0')).toMatchObject({phase:'OPEN',mode:'PAYMENT_STOP',openedAt:opened});expect(()=>events.stepBack('CLOSED','user-0')).toThrow(/geändert/);
++  });
+   it('refuses to close without the announced sales stop', () => {
+     addStaff(2); addProduct();
+     new WristbandImportService(db).importRows([{ bandNumber: '0001', uid: '04A1B2C3D4E5F6' }]);
+diff --git a/apps/api/src/operations/event.service.ts b/apps/api/src/operations/event.service.ts
+index 1a670bc..65826fb 100644
+--- a/apps/api/src/operations/event.service.ts
++++ b/apps/api/src/operations/event.service.ts
+@@ -51,6 +51,7 @@ export class EventService {
+     return this.db.raw.transaction(() => {
+       const { phase } = this.state();
+       if (phase === 'OPEN') throw new DomainError('EVENT_ALREADY_OPEN', 'Die Veranstaltung läuft bereits', 422);
++      if (phase === 'CLOSED') throw new DomainError('EVENT_CLOSED','Für dieselbe Veranstaltung bitte den Abschluss wieder öffnen. Eine neue Veranstaltung benötigt eine separate Datenbank.',422);
+       if (phase === 'CLOSING') throw new DomainError('EVENT_CLOSING', 'Der Abschluss läuft bereits — zuerst abschließen', 422);
+       const blocking = this.checklist().filter(item => item.required && !item.ok);
+       if (blocking.length) throw new DomainError('EVENT_NOT_READY', `Noch offen: ${blocking.map(item => item.label).join(', ')}`, 422);
+@@ -69,14 +70,33 @@ export class EventService {
+       const { phase } = this.state();
+       if (phase !== 'OPEN') throw new DomainError('EVENT_NOT_OPEN', 'Es läuft keine Veranstaltung', 422);
+       const now = Date.now();
+-      this.db.raw.prepare("UPDATE system_state SET event_phase='CLOSING',mode='PAYMENT_STOP',changed_at=?,changed_by=?,reason=? WHERE id=1").run(now, actorId, 'Verkaufsende eingeleitet');
++      this.db.raw.prepare("UPDATE system_state SET event_phase='CLOSING',event_resume_mode=mode,mode='PAYMENT_STOP',changed_at=?,changed_by=?,reason=? WHERE id=1").run(now, actorId, 'Verkaufsende eingeleitet');
+       appendAudit(this.db.raw, { actorId, action: 'EVENT_CLOSING_STARTED', entityType: 'system_state', entityId: '1', payload: { startedAt: now } });
+       return this.state();
+     }).immediate();
+   }
+ 
++  stepBack(expectedPhase:EventPhase,actorId:string) {
++    return this.db.raw.transaction(()=>{
++      const state=this.state();if(state.phase!==expectedPhase)throw new DomainError('EVENT_CHANGED','Veranstaltungsstatus hat sich geändert. Bitte neu laden.',409);
++      const now=Date.now();let next:EventPhase,mode:string='PAYMENT_STOP';
++      if(state.phase==='CLOSED'){next='CLOSING';}
++      else if(state.phase==='CLOSING'){
++        const blocking=this.checklist().filter(i=>i.required&&!i.ok);if(blocking.length)throw new DomainError('EVENT_NOT_READY',`Noch offen: ${blocking.map(i=>i.label).join(', ')}`,422);
++        next='OPEN';mode=(this.db.raw.prepare('SELECT event_resume_mode AS mode FROM system_state WHERE id=1').get() as {mode:string}).mode;
++      }else if(state.phase==='OPEN'){
++        if(this.db.raw.prepare("SELECT 1 FROM financial_operations WHERE created_at>=? AND status IN('PENDING','COMMITTED') AND type IN('TOPUP','PURCHASE','REFUND') LIMIT 1").get(state.openedAt??0))throw new DomainError('EVENT_HAS_PAYMENTS','Bereits gebucht: Zur Vorbereitung zurück nicht möglich. Verkauf kann über den Abschluss pausiert werden.',422);
++        if(this.db.raw.prepare("SELECT 1 FROM cash_sessions WHERE opened_at>=? OR closed_at>=? LIMIT 1").get(state.openedAt??0,state.openedAt??0))throw new DomainError('EVENT_HAS_CASH','Seit dem Start wurde eine Kasse eröffnet oder geschlossen. Bitte Abschluss verwenden.',422);
++        next='PREPARING';
++      }else throw new DomainError('EVENT_PREPARING','Bereits in Vorbereitung',422);
++      this.db.raw.prepare("UPDATE system_state SET event_phase=?,mode=?,event_closed_at=NULL,event_opened_at=CASE WHEN ?='PREPARING' THEN NULL ELSE event_opened_at END,changed_at=?,changed_by=?,reason=? WHERE id=1").run(next,mode,next,now,actorId,`Veranstaltung: ${state.phase} → ${next}`);
++      appendAudit(this.db.raw,{actorId,action:'EVENT_PHASE_REVERSED',entityType:'system_state',entityId:'1',payload:{previous:state.phase,next,previousMode:state.mode,previousOpenedAt:state.openedAt,previousClosedAt:state.closedAt}});
++      return this.state();
++    }).immediate();
++  }
++
+   closingStatus() {
+-    const openCashSessions = this.db.raw.prepare("SELECT id,terminal_id terminalId,opened_at openedAt,opening_cash_cents openingCashCents FROM cash_sessions WHERE status='OPEN'").all() as any[];
++    const openCashSessions = this.db.raw.prepare("SELECT cs.id,cs.terminal_id terminalId,t.name terminalName,cs.opened_at openedAt,cs.opening_cash_cents openingCashCents FROM cash_sessions cs JOIN terminals t ON t.id=cs.terminal_id WHERE cs.status='OPEN' ORDER BY t.name").all() as any[];
+     const outstanding = this.db.raw.prepare("SELECT COUNT(*) n,COALESCE(SUM(balance_cents),0) cents FROM wallets WHERE status<>'CLOSED' AND balance_cents>0").get() as any;
+     const pendingOperations = (this.db.raw.prepare("SELECT COUNT(*) n FROM financial_operations WHERE status='PENDING'").get() as any).n as number;
+     const pendingApprovals = (this.db.raw.prepare("SELECT COUNT(*) n FROM approval_requests WHERE status='PENDING' AND expires_at>=unixepoch('subsec')*1000").get() as any).n as number;
+@@ -90,6 +110,7 @@ export class EventService {
+       const status = this.closingStatus();
+       if (status.openCashSessions.length) throw new DomainError('CASH_SESSIONS_OPEN', `${status.openCashSessions.length} Kassensitzung(en) sind noch offen und müssen gezählt werden`, 422);
+       if (status.pendingOperations) throw new DomainError('OPERATIONS_PENDING', `${status.pendingOperations} Vorgang/Vorgänge sind noch nicht abgeschlossen`, 422);
++      if(this.db.raw.prepare(`SELECT 1 FROM cash_sessions s LEFT JOIN cash_session_operations c ON c.cash_session_id=s.id WHERE s.status='CLOSED' GROUP BY s.id HAVING s.closed_at IS NULL OR s.counted_cash_cents IS NULL OR s.expected_cash_cents IS NULL OR s.difference_cents IS NULL OR s.expected_cash_cents<>s.opening_cash_cents+COALESCE(SUM(c.amount_cents),0) OR s.difference_cents<>s.counted_cash_cents-s.expected_cash_cents OR (s.difference_cents<>0 AND LENGTH(TRIM(COALESCE(s.close_reason,'')))<5) LIMIT 1`).get())throw new DomainError('CASH_RECONCILIATION_INVALID','Mindestens eine geschlossene Kasse ist nicht vollständig abgerechnet',422);
+       if(status.pendingApprovals) throw new DomainError('APPROVALS_PENDING','Offene Freigaben zuerst bearbeiten',422);
+       const issues=ledgerIssues(this.db.raw);if(issues.length)throw new DomainError('LEDGER_MISCONFIGURED',issues.join(', '),503);
+       const now = Date.now();
+diff --git a/apps/api/src/operations/operations.controller.ts b/apps/api/src/operations/operations.controller.ts
+index d207562..51e5fb7 100644
+--- a/apps/api/src/operations/operations.controller.ts
++++ b/apps/api/src/operations/operations.controller.ts
+@@ -3,4 +3,5 @@ import { Body,Controller,Get,Param,Post } from '@nestjs/common';import { z } fro
+  @Get('event')@Roles('BAR','TOPUP','MARKET_MANAGER','PAYMENT_LEAD','ADMIN','AUDITOR')eventState(){return{...this.event.state(),checklist:this.event.checklist(),closing:this.event.closingStatus()}}
+  @Post('event/open')@Roles('PAYMENT_LEAD','ADMIN')openEvent(@Body()b:unknown,@CurrentPrincipal()p:Principal){const x=z.object({name:z.string().min(3).max(120)}).parse(b);this.event.open(x.name,p.sub);return this.eventState()}
+  @Post('event/begin-closing')@Roles('PAYMENT_LEAD','ADMIN')beginClosing(@CurrentPrincipal()p:Principal){this.event.beginClosing(p.sub);return this.eventState()}
+- @Post('event/close')@Roles('PAYMENT_LEAD','ADMIN')closeEvent(@CurrentPrincipal()p:Principal){this.event.close(p.sub);return this.eventState()}@Get('cash-session')@Roles('TOPUP','PAYMENT_LEAD','ADMIN','AUDITOR')current(@CurrentPrincipal()p:Principal){return this.cash.current(p.terminalId)}@Post('cash-session/open')@Roles('TOPUP','PAYMENT_LEAD','ADMIN')open(@Body()b:unknown,@CurrentPrincipal()p:Principal){const x=z.object({openingCashCents:z.number().int().min(0).max(100000)}).parse(b);return this.cash.open(x.openingCashCents,p)}@Post('cash-session/close')@Roles('TOPUP','PAYMENT_LEAD','ADMIN')close(@Body()b:unknown,@CurrentPrincipal()p:Principal){const x=z.object({countedCashCents:z.number().int().min(0).max(1000000),reason:z.string().max(500).optional()}).parse(b);return this.cash.close(x.countedCashCents,x.reason,p)}@Get('report')@Roles('PAYMENT_LEAD','ADMIN','AUDITOR')report(){return this.reports.summary()}@Get('signed-reports')@Roles('PAYMENT_LEAD','ADMIN','AUDITOR')signedReportList(){return this.signedReports.list()}@Get('signed-reports/:id')@Roles('PAYMENT_LEAD','ADMIN','AUDITOR')signedReport(@Param('id')reportId:string){return this.signedReports.get(reportId)}@Post('signed-reports')@Roles('PAYMENT_LEAD','ADMIN')createSignedReport(@CurrentPrincipal()p:Principal){return this.signedReports.create(p.sub)}@Get('backups')@Roles('ADMIN','AUDITOR')backupsList(){return this.backups.list()}@Post('backups')@Roles('ADMIN')backup(@CurrentPrincipal()p:Principal){return this.backups.create(p.sub)}}
++ @Post('event/back')@Roles('PAYMENT_LEAD','ADMIN')backEvent(@Body()b:unknown,@CurrentPrincipal()p:Principal){const x=z.object({expectedPhase:z.enum(['PREPARING','OPEN','CLOSING','CLOSED'])}).parse(b);this.event.stepBack(x.expectedPhase,p.sub);return this.eventState()}
++ @Post('event/close')@Roles('PAYMENT_LEAD','ADMIN')closeEvent(@CurrentPrincipal()p:Principal){this.event.close(p.sub);return this.eventState()}@Get('cash-session')@Roles('TOPUP','PAYMENT_LEAD','ADMIN','AUDITOR')current(@CurrentPrincipal()p:Principal){return this.cash.current(p.terminalId)}@Post('cash-session/open')@Roles('TOPUP','PAYMENT_LEAD','ADMIN')open(@Body()b:unknown,@CurrentPrincipal()p:Principal){const x=z.object({openingCashCents:z.number().int().min(0).max(100000)}).parse(b);return this.cash.open(x.openingCashCents,p)}@Get('cash-sessions')@Roles('PAYMENT_LEAD','ADMIN','AUDITOR')allCash(){return this.cash.listOpen()}@Post('cash-session/close')@Roles('TOPUP','PAYMENT_LEAD','ADMIN')close(@Body()b:unknown,@CurrentPrincipal()p:Principal){const x=z.object({countedCashCents:z.number().int().min(0).max(1000000),sessionId:z.string().uuid(),expectedCashCents:z.number().int().min(0),reason:z.string().max(500).optional()}).parse(b);return this.cash.close(x.countedCashCents,x.reason,p,x.sessionId,x.expectedCashCents)}@Get('report')@Roles('PAYMENT_LEAD','ADMIN','AUDITOR')report(){return this.reports.summary()}@Get('signed-reports')@Roles('PAYMENT_LEAD','ADMIN','AUDITOR')signedReportList(){return this.signedReports.list()}@Get('signed-reports/:id')@Roles('PAYMENT_LEAD','ADMIN','AUDITOR')signedReport(@Param('id')reportId:string){return this.signedReports.get(reportId)}@Post('signed-reports')@Roles('PAYMENT_LEAD','ADMIN')createSignedReport(@CurrentPrincipal()p:Principal){return this.signedReports.create(p.sub)}@Get('backups')@Roles('ADMIN','AUDITOR')backupsList(){return this.backups.list()}@Post('backups')@Roles('ADMIN')backup(@CurrentPrincipal()p:Principal){return this.backups.create(p.sub)}}
+diff --git a/apps/api/src/operations/reporting.service.ts b/apps/api/src/operations/reporting.service.ts
+index a8d9e40..8e7acbe 100644
+--- a/apps/api/src/operations/reporting.service.ts
++++ b/apps/api/src/operations/reporting.service.ts
+@@ -20,6 +20,7 @@ import { Injectable } from '@nestjs/common';import { DatabaseService } from '../
+   const productSales=[...sales.entries()].map(([name,v])=>({name,...v})).sort((a,b)=>b.revenueCents-a.revenueCents);
+   const refundTotals=this.db.raw.prepare("SELECT COALESCE(SUM(r.amount_cents),0) totalCents,COALESCE(SUM(CASE WHEN o.status='PAID' THEN r.amount_cents ELSE 0 END),0) partialUnallocatedCents FROM refunds r JOIN orders o ON o.id=r.original_order_id").get();
+   const startingCredit=this.db.raw.prepare("SELECT -COALESCE(SUM(e.amount_cents),0) netCents FROM ledger_entries e JOIN ledger_accounts a ON a.id=e.account_id WHERE a.type='STARTING_BALANCE'").get();
+-  return{generatedAt:Date.now(),integrityIssues:ledgerIssues(this.db.raw),wallets,operations,topupsByMethod,productSales,refundTotals,startingCredit,cashSessions:sessions,auditEventCount:audit};
++  const freeDrinks=this.db.raw.prepare('SELECT COUNT(*) granted,COUNT(redeemed_order_id) redeemed,COALESCE(SUM(original_price_cents),0) faceValueCents FROM free_drink_entitlements').get();
++  return{freeDrinks,generatedAt:Date.now(),integrityIssues:ledgerIssues(this.db.raw),wallets,operations,topupsByMethod,productSales,refundTotals,startingCredit,cashSessions:sessions,auditEventCount:audit};
+  }
+ }
+diff --git a/apps/api/src/wallet/wallet.controller.ts b/apps/api/src/wallet/wallet.controller.ts
+index b8c5130..ae3805c 100644
+--- a/apps/api/src/wallet/wallet.controller.ts
++++ b/apps/api/src/wallet/wallet.controller.ts
+@@ -1,5 +1,6 @@
+-import { Body,Controller,Post } from '@nestjs/common';import { z } from 'zod';import { Roles } from '../auth/auth.js';import { WalletService } from './wallet.service.js';
++import { Body,Controller,Post } from '@nestjs/common';import { z } from 'zod';import { CurrentPrincipal,Roles,type Principal } from '../auth/auth.js';import { WalletService } from './wallet.service.js';
+ @Controller('wallets') export class WalletController{constructor(private wallet:WalletService){}
+  @Post('lookup') @Roles('BAR','TOPUP','PAYMENT_LEAD','ADMIN') lookup(@Body() b:unknown){return this.wallet.lookup(z.object({uid:z.string()}).parse(b).uid)}
++ @Post('free-drink') @Roles('PAYMENT_LEAD','ADMIN') grant(@Body() b:unknown,@CurrentPrincipal() p:Principal){const x=z.object({uid:z.string().min(1).max(100),expectedWalletId:z.string().min(1).max(80)}).parse(b);return this.wallet.grantFreeDrink(x.uid,x.expectedWalletId,p.sub)}
+  @Post('history') @Roles('BAR','TOPUP','PAYMENT_LEAD','ADMIN','AUDITOR') history(@Body() b:unknown){return this.wallet.history(z.object({uid:z.string()}).parse(b).uid)}
+ }
+diff --git a/apps/api/src/wallet/wallet.service.ts b/apps/api/src/wallet/wallet.service.ts
+index 614dd6b..2fd8ec2 100644
+--- a/apps/api/src/wallet/wallet.service.ts
++++ b/apps/api/src/wallet/wallet.service.ts
+@@ -1,8 +1,9 @@
+ import { Injectable } from '@nestjs/common';
+ import { DatabaseService } from '../database/database.service.js';
+ import { DomainError } from '../common/domain-error.js';
++import { appendAudit } from '../common/audit.js';
+ import { resolveBandId } from './band-identity.js';
+-const WALLET_FIELDS=`w.id walletId,w.balance_cents balanceCents,w.status,wb.band_number bandNumber,wb.uid_hex uidHex,wb.kind,wb.status wristbandStatus`;
++const WALLET_FIELDS=`w.id walletId,w.balance_cents balanceCents,w.status,wb.band_number bandNumber,wb.uid_hex uidHex,wb.kind,wb.status wristbandStatus,CASE WHEN EXISTS(SELECT 1 FROM free_drink_entitlements f WHERE f.wallet_id=w.id AND f.redeemed_order_id IS NULL) THEN 'AVAILABLE' WHEN EXISTS(SELECT 1 FROM free_drink_entitlements f WHERE f.wallet_id=w.id) THEN 'REDEEMED' ELSE 'NONE' END freeDrinkStatus`;
+ const SELECT_WALLET=`SELECT ${WALLET_FIELDS} FROM wristbands wb JOIN wristband_assignments a ON a.wristband_id=wb.id AND a.revoked_at IS NULL JOIN wallets w ON w.id=a.wallet_id WHERE wb.status='ACTIVE' AND `;
+ const SELECT_WALLET_ANY=`SELECT ${WALLET_FIELDS} FROM wristbands wb JOIN wristband_assignments a ON a.wristband_id=wb.id AND a.revoked_at IS NULL JOIN wallets w ON w.id=a.wallet_id WHERE `;
+ @Injectable() export class WalletService{
+@@ -19,20 +20,30 @@ const SELECT_WALLET_ANY=`SELECT ${WALLET_FIELDS} FROM wristbands wb JOIN wristba
+     const bandId=resolveBandId(this.db.raw,rawInput);
+     const row=bandId?this.db.raw.prepare(select+'wb.id=?').get(bandId):null;
+     if(!row)throw new DomainError('WRISTBAND_NOT_ACTIVE','Wristband is unknown, blocked or not assigned',404);
+-    return row as {walletId:string;balanceCents:number;status:string;bandNumber:string;uidHex:string|null;kind:'NFC'|'TYVEK';wristbandStatus:string};
++    return row as {walletId:string;balanceCents:number;status:string;bandNumber:string;uidHex:string|null;kind:'NFC'|'TYVEK';wristbandStatus:string;freeDrinkStatus:'NONE'|'AVAILABLE'|'REDEEMED'};
+   }
++  grantFreeDrink(identifier:string,expectedWalletId:string,actorId:string){return this.db.raw.transaction(()=>{
++    const lead=this.db.raw.prepare("SELECT 1 FROM users u JOIN user_roles r ON r.user_id=u.id WHERE u.id=? AND u.active=1 AND r.role IN('ADMIN','PAYMENT_LEAD')").get(actorId);
++    if(!lead)throw new DomainError('FREE_DRINK_FORBIDDEN','Nur die Leitung darf Freigetränke vergeben',403);
++    const phase=(this.db.raw.prepare('SELECT event_phase FROM system_state WHERE id=1').get() as any)?.event_phase;
++    if(!['PREPARING','OPEN'].includes(phase))throw new DomainError('EVENT_NOT_OPEN','Keine neuen Freigetränke nach Verkaufsende',422);
++    const wallet=this.lookup(identifier);if(wallet.walletId!==expectedWalletId||wallet.status!=='ACTIVE')throw new DomainError('WALLET_CHANGED','Armband neu scannen',409);
++    const result=this.db.raw.prepare('INSERT INTO free_drink_entitlements(wallet_id,granted_by,granted_at) VALUES(?,?,?) ON CONFLICT(wallet_id) DO NOTHING').run(wallet.walletId,actorId,Date.now());
++    if(result.changes)appendAudit(this.db.raw,{actorId,action:'FREE_DRINK_GRANTED',entityType:'wallet',entityId:wallet.walletId});
++    return this.lookup(identifier);
++  }).immediate()}
+   // One scan, the full picture: staff deciding whether to approve a Storno or band swap need to
+   // see what actually happened on this wallet, not just its current balance. Purchases carry
+   // refundableCents so the UI can offer "Stornieren" only where money is actually left to return.
+   history(rawInput:string){
+     const wallet=this.lookupAny(rawInput);
+-    const orders=this.db.raw.prepare(`SELECT o.id,o.total_cents totalCents,o.status,o.created_at createdAt,
++    const orders=this.db.raw.prepare(`SELECT o.id,o.total_cents totalCents,o.status,o.created_at createdAt,EXISTS(SELECT 1 FROM free_drink_entitlements f WHERE f.redeemed_order_id=o.id) freeDrink,
+       COALESCE((SELECT SUM(amount_cents) FROM refunds WHERE original_order_id=o.id),0) refundedCents
+       FROM orders o WHERE o.wallet_id=? ORDER BY o.created_at DESC LIMIT 201`).all(wallet.walletId) as any[];
+     const topups=this.db.raw.prepare(`SELECT id,amount_cents amountCents,funding_method fundingMethod,payment_reference paymentReference,status,created_at createdAt FROM topups WHERE wallet_id=? ORDER BY created_at DESC LIMIT 201`).all(wallet.walletId) as any[];
+     const refunds=this.db.raw.prepare(`SELECT r.id,r.original_order_id orderId,r.amount_cents amountCents,r.reason,r.created_at createdAt FROM refunds r JOIN orders o ON o.id=r.original_order_id WHERE o.wallet_id=? ORDER BY r.created_at DESC LIMIT 201`).all(wallet.walletId) as any[];
+     const entries=[
+-      ...orders.map(o=>({type:'PURCHASE' as const,id:o.id,amountCents:-o.totalCents,status:o.status,createdAt:o.createdAt,refundableCents:o.totalCents-o.refundedCents})),
++      ...orders.map(o=>({type:'PURCHASE' as const,id:o.id,amountCents:-o.totalCents,status:o.status,createdAt:o.createdAt,refundableCents:o.totalCents-o.refundedCents,freeDrink:Boolean(o.freeDrink)})),
+       ...topups.map(t=>({type:'TOPUP' as const,id:t.id,amountCents:t.amountCents,status:t.status,createdAt:t.createdAt,fundingMethod:t.fundingMethod,paymentReference:t.paymentReference})),
+       ...refunds.map(r=>({type:'REFUND' as const,id:r.id,orderId:r.orderId,amountCents:r.amountCents,createdAt:r.createdAt,reason:r.reason})),
+     ].sort((a,b)=>b.createdAt-a.createdAt);
+diff --git a/apps/api/src/wallet/wristband-admin.controller.ts b/apps/api/src/wallet/wristband-admin.controller.ts
+index 4d97e62..b141c49 100644
+--- a/apps/api/src/wallet/wristband-admin.controller.ts
++++ b/apps/api/src/wallet/wristband-admin.controller.ts
+@@ -2,8 +2,8 @@ import { Body,Controller,Get,Post } from '@nestjs/common';import { z } from 'zod
+ @Controller('wristbands')export class WristbandAdminController{constructor(private admin:WristbandAdminService){}
+  @Get()@Roles('TOPUP','PAYMENT_LEAD','ADMIN','AUDITOR')list(){return this.admin.list()}
+  @Post('register')@Roles('TOPUP','PAYMENT_LEAD','ADMIN')register(@Body()b:unknown,@CurrentPrincipal()p:Principal){const x=z.discriminatedUnion('kind',[
+-  z.object({kind:z.literal('NFC'),bandNumber:z.string().min(1).max(40),uid:z.string().min(4),initialBalanceCents:z.number().int().min(0).max(20000).default(0)}),
+-  z.object({kind:z.literal('TYVEK'),bandNumber:z.string().min(1).max(40),uid:z.string().optional(),initialBalanceCents:z.number().int().min(0).max(20000).default(0)})
++  z.object({kind:z.literal('NFC'),bandNumber:z.string().min(1).max(40),uid:z.string().min(4),freeDrink:z.boolean().optional(),initialBalanceCents:z.number().int().min(0).max(20000).default(0)}),
++  z.object({kind:z.literal('TYVEK'),bandNumber:z.string().min(1).max(40),uid:z.string().optional(),freeDrink:z.boolean().optional(),initialBalanceCents:z.number().int().min(0).max(20000).default(0)})
+  ]).parse(b);if(x.initialBalanceCents!==0&&x.initialBalanceCents!==500)throw new DomainError('INVALID_STARTING_BALANCE','Nur 0 € oder 5 € Startguthaben erlaubt',422);return this.admin.register(x,p.sub)}
+  @Post('block')@Roles('PAYMENT_LEAD','ADMIN')block(@Body()b:unknown,@CurrentPrincipal()p:Principal){const x=z.object({uid:z.string(),reason:z.string().min(5).max(500)}).parse(b);return this.admin.block(x.uid,x.reason,p.sub)}
+ }
+diff --git a/apps/api/src/wallet/wristband-admin.service.ts b/apps/api/src/wallet/wristband-admin.service.ts
+index 7f660ed..fb9f4dd 100644
+--- a/apps/api/src/wallet/wristband-admin.service.ts
++++ b/apps/api/src/wallet/wristband-admin.service.ts
+@@ -10,15 +10,18 @@ import { appendAudit } from '../common/audit.js';
+ @Injectable() export class WristbandAdminService{
+   private resolveBand(identifier:string){return resolveBandId(this.db.raw,identifier)}
+   constructor(private db:DatabaseService){}
+-  list(){return this.db.raw.prepare(`SELECT wb.id,wb.band_number bandNumber,wb.uid_hex uidHex,wb.kind,wb.status,wb.created_at createdAt,w.balance_cents balanceCents,
++  list(){return this.db.raw.prepare(`SELECT wb.id,wb.band_number bandNumber,wb.uid_hex uidHex,wb.kind,wb.status,wb.created_at createdAt,w.balance_cents balanceCents,CASE WHEN EXISTS(SELECT 1 FROM free_drink_entitlements f WHERE f.wallet_id=w.id AND f.redeemed_order_id IS NULL) THEN 'AVAILABLE' WHEN EXISTS(SELECT 1 FROM free_drink_entitlements f WHERE f.wallet_id=w.id) THEN 'REDEEMED' ELSE 'NONE' END freeDrinkStatus,
+     COALESCE((SELECT SUM(le.amount_cents) FROM ledger_entries le JOIN ledger_accounts la ON la.id=le.account_id JOIN financial_operations fo ON fo.id=le.operation_id WHERE la.wallet_id=w.id AND fo.type='STARTING_BALANCE'),0) initialBalanceCents
+     FROM wristbands wb LEFT JOIN wristband_assignments a ON a.wristband_id=wb.id AND a.revoked_at IS NULL LEFT JOIN wallets w ON w.id=a.wallet_id ORDER BY wb.band_number COLLATE NOCASE`).all()}
+-  register(input:{bandNumber:string;uid?:string;kind:'NFC'|'TYVEK';initialBalanceCents:number},actorId:string){
++  register(input:{bandNumber:string;uid?:string;kind:'NFC'|'TYVEK';initialBalanceCents:number;freeDrink?:boolean},actorId:string){
+     const bandNumber=input.bandNumber.trim();
+     if(!bandNumber)throw new DomainError('BAND_NUMBER_REQUIRED','Band number is required',400);
+     if(![0,500].includes(input.initialBalanceCents))throw new DomainError('INVALID_STARTING_BALANCE','Nur 0 € oder 5 € Startguthaben erlaubt',400);
+     const uid=input.kind==='NFC'?normalizeUid(input.uid??''):null;
+     return this.db.raw.transaction(()=>{
++      const phase=(this.db.raw.prepare('SELECT event_phase FROM system_state WHERE id=1').get() as any)?.event_phase;
++      if(!['PREPARING','OPEN'].includes(phase))throw new DomainError('EVENT_NOT_OPEN','Nach Verkaufsende keine neuen Armbänder registrieren',422);
++      if(input.freeDrink&&!this.db.raw.prepare("SELECT 1 FROM users u JOIN user_roles r ON r.user_id=u.id WHERE u.id=? AND u.active=1 AND r.role IN('ADMIN','PAYMENT_LEAD')").get(actorId))throw new DomainError('FREE_DRINK_FORBIDDEN','Nur die Leitung darf Freigetränke vergeben',403);
+       if(this.resolveBand(bandNumber)||(uid&&this.resolveBand(uid)))throw new DomainError('WRISTBAND_EXISTS','This band number or UID is already registered',409);
+       const wristbandId=id(),walletId=id(),now=Date.now();
+       this.db.raw.prepare("INSERT INTO wristbands(id,band_number,uid_hex,kind,status,created_at) VALUES(?,?,?,?,'ACTIVE',?)").run(wristbandId,bandNumber,uid,input.kind,now);
+@@ -35,6 +38,7 @@ import { appendAudit } from '../common/audit.js';
+         this.db.raw.prepare('INSERT INTO ledger_entries VALUES(?,?,?,?,?)').run(id(),operationId,clearing.id,-input.initialBalanceCents,now);
+         this.db.raw.prepare('UPDATE wallets SET balance_cents=?,version=version+1 WHERE id=?').run(input.initialBalanceCents,walletId);
+       }
++      if(input.freeDrink){this.db.raw.prepare('INSERT INTO free_drink_entitlements(wallet_id,granted_by,granted_at) VALUES(?,?,?)').run(walletId,actorId,now);appendAudit(this.db.raw,{actorId,action:'FREE_DRINK_GRANTED',entityType:'wallet',entityId:walletId});}
+       appendAudit(this.db.raw,{actorId,action:'WRISTBAND_REGISTERED',entityType:'wristband',entityId:wristbandId,payload:{bandNumber,uid,kind:input.kind,initialBalanceCents:input.initialBalanceCents}});
+       return{id:wristbandId,bandNumber,uidHex:uid,kind:input.kind,status:'ACTIVE',balanceCents:input.initialBalanceCents,initialBalanceCents:input.initialBalanceCents};
+     }).immediate()
+@@ -45,6 +49,7 @@ import { appendAudit } from '../common/audit.js';
+     const purchases=this.db.raw.prepare('SELECT 1 FROM orders WHERE wallet_id=? LIMIT 1').get(replacement.wallet_id);
+     const topups=this.db.raw.prepare('SELECT 1 FROM topups WHERE wallet_id=? LIMIT 1').get(replacement.wallet_id);
+     const unusedCredit=entries.length===1&&entries[0].type==='STARTING_BALANCE'&&entries[0].status==='COMMITTED'&&entries[0].amount===replacement.balance_cents&&replacement.balance_cents===500;
++    if(this.db.raw.prepare('SELECT 1 FROM free_drink_entitlements WHERE wallet_id=?').get(replacement.wallet_id))throw new DomainError('REPLACEMENT_WALLET_USED','Ersatzarmband hat bereits ein Freigetränk',422);
+     if(purchases||topups||(!unusedCredit&&(replacement.balance_cents!==0||entries.length!==0)))throw new DomainError('REPLACEMENT_WALLET_USED','Ersatzarmband wurde bereits verwendet',422);
+     const now=Date.now();
+     // Reverse only the unused complimentary credit, never real money. Keep both ledger entries.
+diff --git a/apps/web/src/App.tsx b/apps/web/src/App.tsx
+index fdd4e9c..ded5078 100644
+--- a/apps/web/src/App.tsx
++++ b/apps/web/src/App.tsx
+@@ -5,7 +5,6 @@ import TerminalApp from './terminal/TerminalApp';
+ import DiagnosticsPage from './diagnostics/DiagnosticsPage';
+ import PayDisplayPage from './pay-display/PayDisplayPage';
+ import { BOARD_COLUMN,boardUnit,BoardFooter,CATEGORY_HEADING,CrashBar,DrinkName,euro,MarketRow,marketTrend,MomentOverlay,priceNum,Sparkline,type Moment } from './market/parts';
+-import { useMarketAudio } from './market/audio';
+ import './display.css';
+ 
+ export default function App(){const display=new URLSearchParams(location.search).get('display');return display==='diagnostics'?<DiagnosticsPage/>:display==='pay'?<PayDisplayPage/>:location.pathname==='/market'||display==='market'?<MarketDisplay/>:<TerminalApp/>}
+@@ -24,8 +23,8 @@ function useHandheld(){
+     const mq=window.matchMedia(HANDHELD_QUERY);
+     const update=()=>setHandheld(mq.matches);
+     update();
+-    mq.addEventListener('change',update);
+-    return()=>mq.removeEventListener('change',update);
++    if(mq.addEventListener){mq.addEventListener('change',update);return()=>mq.removeEventListener('change',update)}
++    mq.addListener(update);return()=>mq.removeListener(update);
+   },[]);
+   return handheld;
+ }
+@@ -34,7 +33,7 @@ function useHandheld(){
+ // at the top, the curve takes whatever height is left. Everything scales from the same --u unit as
+ // the drink rows, so the two regions never drift apart typographically.
+ function FocusCard({product,mode,fade,history,charts,compact=false}:{product:Product;mode:SpotMode;fade:boolean;history:MarketPoint[];charts:boolean;compact?:boolean}){
+-  const{percent,color}=marketTrend(product,history);
++  const{color}=marketTrend(product,history);const base=product.basePriceCents??product.priceCents;const percent=base?(product.priceCents-base)/base*100:0;
+   // compact = stacked under the board on a handheld, where it is a short banner rather than a
+   // full-height column, so nothing here may claim leftover vertical space.
+   return <section className={compact?'flex flex-col':'flex-1 min-h-0 flex flex-col'}>
+@@ -59,11 +58,11 @@ function MarketDisplay(){
+   const config=useMemo(()=>parseMarketDisplayConfig(location.search),[]),api=useMemo(()=>new Api(),[]);
+   const handheld=useHandheld();
+   const[products,setProducts]=useState<Product[]>([]),[history,setHistory]=useState<MarketPoint[]>([]),[health,setHealth]=useState<any>();
++  const[lastUpdate,setLastUpdate]=useState(0),[serverOffset,setServerOffset]=useState(0);
+   const[clock,setClock]=useState(()=>new Date());
+   const[spot,setSpot]=useState<{id:string;mode:SpotMode}|null>(null),[spotFade,setSpotFade]=useState(false);
+   const[moment,setMoment]=useState<Moment|null>(null);
+   const[crash,setCrash]=useState<{until:number;kind:string}|null>(null);
+-  const audio=useMarketAudio(config.sound);
+   const prevCrashingRef=useRef(false);
+   useEffect(()=>{const t=setInterval(()=>setClock(new Date()),1000);return()=>clearInterval(t)},[]);
+ 
+@@ -98,7 +97,7 @@ function MarketDisplay(){
+     setFleetTest(false);
+   }
+ 
+-  const visibleRef=useRef<Product[]>([]),historyRef=useRef<MarketPoint[]>([]);
++  const visibleRef=useRef<Product[]>([]);
+   const prevProductsRef=useRef<Record<string,Product>>({}),coolRef=useRef<Record<string,number>>({});
+   const momentQueueRef=useRef<Moment[]>([]),showingRef=useRef(false),lastShowRef=useRef(0);
+   function pumpMoments(){
+@@ -132,70 +131,42 @@ function MarketDisplay(){
+     prevProductsRef.current=Object.fromEntries(list.map(p=>[p.id,p]));
+     pumpMoments();
+   }
+-  // Any remote key, tap or click counts as the gesture the autoplay policy wants — not just OK.
+-  // A display that silently lost its audio on a reload then recovers from whatever button someone
+-  // happens to press, instead of needing one specific key nobody remembers. Handled directly in
+-  // the user event (never behind a timer), which is what Android 14 and Phlox require.
+-  useEffect(()=>{
+-    if(!config.sound||!audio.needsUnlockPrompt)return;
+-    const onGesture=()=>{void audio.unlock()};
+-    window.addEventListener('keydown',onGesture);
+-    window.addEventListener('pointerdown',onGesture);
+-    return()=>{window.removeEventListener('keydown',onGesture);window.removeEventListener('pointerdown',onGesture)};
+-  },[audio.needsUnlockPrompt,audio.unlock,config.sound]);
+-  // Every TV polls the server independently, so the moment each one first notices a crash can be
+-  // up to a poll-interval apart. Rather than each display announcing it the instant it finds out,
+-  // every display schedules the big reveal (full-screen moment + sound) for the same rounded
+-  // wall-clock instant a short moment out — since they all compute that instant from Date.now()
+-  // the same way, any display that has detected the crash by then fires in lockstep with the
+-  // others. Everything crash-visible (banner, board prices, chart) is held back until that same
+-  // instant too. Rounded to the nearest second (not 10s, like the fleet-diagnostics reveal below)
+-  // and a short 250ms buffer, so the physical crash button reaches every display close to
+-  // real-time — worst case is roughly one poll interval plus ~1.25s, not the ~12s a 10s/2s
+-  // boundary would add.
+-  const pendingRevealRef=useRef<number|null>(null),pendingApplyTimerRef=useRef<ReturnType<typeof setTimeout>|null>(null);
+-  function detectCrash(h:any){
+-    const until=h?.state?.crashUntil??0,kind=h?.state?.crashKind==='AUSVERKAUF'?'AUSVERKAUF':'CRASH',crashingNow=until>Date.now();
++  // Prices update immediately from the coherent snapshot. A visual crash announcement never delays them.
++  function detectCrash(h:any,serverTime:number){
++    const until=h?.state?.crashUntil??0,kind=h?.state?.crashKind==='AUSVERKAUF'?'AUSVERKAUF':'CRASH',crashingNow=until>serverTime&&h?.ok&&h?.state?.mode==='NORMAL'&&h?.state?.eventPhase==='OPEN';
+     if(crashingNow&&!prevCrashingRef.current){
+-      const revealAt=Math.ceil(Date.now()/1000)*1000+250;
+-      pendingRevealRef.current=revealAt;
+-      setTimeout(()=>{
+-        momentQueueRef.current.unshift(kind==='AUSVERKAUF'
+-          ?{tone:'crash',title:'Ausverkauf',sub:'Alles zum Tiefstpreis · jetzt leer trinken'}
+-          :{tone:'crash',title:'Börsencrash',sub:'Alle Preise im Keller · jetzt bestellen'});
+-        pumpMoments();
+-        if(config.sound)void audio.playCrash();
+-      },Math.max(0,revealAt-Date.now()));
++      momentQueueRef.current=[];
++      momentQueueRef.current.push(kind==='AUSVERKAUF'?{tone:'crash',title:'Ausverkauf',sub:'Alles zum Tiefstpreis · jetzt bestellen'}:{tone:'crash',title:'Börsencrash',sub:'Alle Preise auf Tiefstand · jetzt bestellen'});
++      pumpMoments();
+     }
+-    if(!crashingNow)pendingRevealRef.current=null;
++    if(!crashingNow&&prevCrashingRef.current)momentQueueRef.current=momentQueueRef.current.filter(m=>m.tone!=='crash');
+     prevCrashingRef.current=crashingNow;
+     return{crashingNow,until,kind};
+   }
+ 
+   useEffect(()=>{
+-    let active=true;
++    let active=true,inFlight=false;let controller:AbortController|undefined;
+     const refresh=async()=>{
++      if(inFlight)return;inFlight=true;controller=new AbortController();const timeout=setTimeout(()=>controller?.abort(),Math.max(5000,config.refreshMs*2));
+       try{
+-        const[p,hist,h]=await Promise.all([api.products(),api.marketHistory(),api.health()]);
++        const hist=await api.marketHistory(controller.signal);
++        if(!hist.snapshot||!Array.isArray(hist.snapshot.products)||!Array.isArray(hist.points))throw new Error("Ungültiger Kursstand");
++        const {products:p,health:h}=hist.snapshot;
+         if(!active)return;
+-        setHealth(h);
++        setHealth(h);setLastUpdate(Date.now());setServerOffset(hist.snapshot.serverTime-Date.now());
+         maybeStartFleetTest(h?.state?.diagnosticsRequestedAt??0);
+-        const{crashingNow,until,kind}=detectCrash(h);
++        const{crashingNow,until,kind}=detectCrash(h,hist.snapshot.serverTime);
+         const applyData=()=>{setProducts(p);setHistory(hist.points);setCrash(crashingNow?{until,kind}:null);detectMoments(p,crashingNow)};
+-        const revealAt=pendingRevealRef.current;
+-        if(revealAt!==null&&Date.now()<revealAt){
+-          if(pendingApplyTimerRef.current)clearTimeout(pendingApplyTimerRef.current);
+-          pendingApplyTimerRef.current=setTimeout(()=>{if(active){applyData();pendingApplyTimerRef.current=null}},revealAt-Date.now());
+-        }else applyData();
+-      }catch{if(active)setHealth({ok:false,state:{mode:'VERBINDUNGSFEHLER'}})}
++        applyData();
++      }catch{if(active)setHealth({ok:false,state:{mode:'VERBINDUNGSFEHLER'}})}finally{clearTimeout(timeout);inFlight=false}
+     };
+     void refresh();
+     const timer=setInterval(refresh,config.refreshMs);
+-    return()=>{active=false;clearInterval(timer);if(pendingApplyTimerRef.current)clearTimeout(pendingApplyTimerRef.current)};
++    return()=>{active=false;controller?.abort();clearInterval(timer);};
+   },[api,config.refreshMs]);
+ 
+   const visible=config.category?products.filter(p=>p.category.localeCompare(config.category!,'de',{sensitivity:'base'})===0):products;
+-  visibleRef.current=visible;historyRef.current=history;
++  visibleRef.current=visible;
+   const groups=Object.entries(visible.reduce<Record<string,Product[]>>((all,p)=>{(all[p.category]??=[]).push(p);return all},{}));
+   // A single category with far more drinks than the others (e.g. a big "Cocktails" list next to a
+   // handful of beers) would otherwise dominate whichever column it lands in — since every column
+@@ -204,7 +175,8 @@ function MarketDisplay(){
+   // columns instead, so no single column towers over the rest.
+   // One column on a handheld no matter what the URL asks for: two 170px columns on a phone leave
+   // no room for a name, a curve, a trend and a price side by side.
+-  const boardColumns=handheld?1:config.categoryColumns;
++  const portrait=config.format==='9x16';
++  const boardColumns=handheld||portrait?1:Math.min(config.categoryColumns,Math.max(1,visible.length));
+   const fairShare=visible.length/Math.max(1,boardColumns);
+   const packable=groups.flatMap(([category,items])=>{
+     if(items.length>4&&items.length>fairShare*1.5){
+@@ -232,7 +204,7 @@ function MarketDisplay(){
+   useEffect(()=>{
+     let first=true;const modeRef={current:'discount' as SpotMode};
+     const pick=(mode:SpotMode)=>{
+-      const candidates=visibleRef.current.filter(p=>p.minPriceCents<p.maxPriceCents&&!p.soldOut).map(p=>({p,...marketTrend(p,historyRef.current)}));
++      const candidates=visibleRef.current.filter(p=>p.minPriceCents<p.maxPriceCents&&!p.soldOut&&Boolean(p.basePriceCents)).map(p=>({p,percent:(p.priceCents-p.basePriceCents!)/p.basePriceCents!*100}));
+       if(!candidates.length)return null;
+       const best=mode==='discount'?candidates.reduce((a,b)=>b.percent<a.percent?b:a):candidates.reduce((a,b)=>b.percent>a.percent?b:a);
+       return(mode==='discount'?best.percent<=-3:best.percent>=3)?best.p:null;
+@@ -277,6 +249,7 @@ function MarketDisplay(){
+       setUnit(boardUnit({handheld,perColumn,boardHeight:el.clientHeight,unitsToFit}));
+     };
+     compute();
++    if(typeof ResizeObserver==='undefined'){window.addEventListener('resize',compute);return()=>window.removeEventListener('resize',compute)}
+     const ro=new ResizeObserver(compute);ro.observe(el);
+     return()=>ro.disconnect();
+     // handheld/boardColumns belong here explicitly: without them a mode switch could leave the
+@@ -284,7 +257,9 @@ function MarketDisplay(){
+   },[handheld,boardColumns,maxColumnUnits,totalUnitsSignature]);
+ 
+   const mode=health?.state?.mode??'VERBINDE…';
+-  const footerNote=mode==='PAYMENT_STOP'?'Zahlungen gestoppt':mode==='PRICE_FROZEN'?'Preise eingefroren · letzter Stand':'';
++  const stale=!lastUpdate||clock.getTime()-lastUpdate>Math.max(5000,config.refreshMs*3)||mode==='VERBINDUNGSFEHLER';
++  const phase=health?.state?.eventPhase;
++  const footerNote=stale?'Keine aktuellen Kurse · letzter bekannter Stand':!health?.ok?'Systemprüfung fehlgeschlagen · Kasse informieren':phase==='PREPARING'?'Veranstaltung in Vorbereitung':phase==='CLOSED'?'Veranstaltung beendet':phase==='CLOSING'||mode==='PAYMENT_STOP'?'Zahlungen gestoppt':mode==='PRICE_FROZEN'?'Preise eingefroren · letzter Stand':`Stand: ${new Date(lastUpdate+serverOffset).toLocaleTimeString('de-DE')} · Trend: letzte 24 Kursstände`;
+   // Format-specific overrides (used to be CSS attribute-selector rules keyed off a `.format-*`
+   // class; expressed directly as conditional Tailwind classes here since the component already
+   // knows config.format).
+@@ -302,9 +277,9 @@ function MarketDisplay(){
+   // The focus area now owns a dedicated quarter of the width, so it no longer has to compete with
+   // the drinks for leftover space in a column — it shows whenever there is something worth
+   // featuring, and the board simply takes the full width when there is not.
+-  const showFocusCard=config.showFocus;
++  const showFocusCard=config.showFocus&&!portrait&&!stale;
+ 
+-  const crashLeft=crash?Math.max(0,Math.ceil((crash.until-clock.getTime())/1000)):0;
++  const crashLeft=crash?Math.max(0,Math.ceil((crash.until-clock.getTime()-serverOffset)/1000)):0;
+   if(fleetTest)return<DiagnosticsPage embedded networkTestSeconds={15} onComplete={finishFleetTest}/>;
+   // kiosk-lock (and the hard viewport height) only in kiosk mode: on a handheld the page has to
+   // scroll like any other page, and locking the body there would trap the user on the first screen.
+@@ -318,7 +293,7 @@ function MarketDisplay(){
+         <span className="mt-[0.35em] font-ticker-display text-[length:clamp(9px,1.25vh,16px)] font-semibold uppercase tracking-[0.1em] text-ticker-muted">{clock.toLocaleDateString('de-DE',{weekday:'short',day:'2-digit',month:'2-digit'})}</span>
+       </div>
+     </header>
+-    {crash&&<CrashBar kind={crash.kind} secondsLeft={crashLeft}/>}
++    {!stale&&health?.ok&&phase==='OPEN'&&mode==='NORMAL'&&crash&&crashLeft>0&&<CrashBar kind={crash.kind} secondsLeft={crashLeft}/>}
+     {/* Height follows its own font size (py in em), so the tape is proportional on a phone and on
+         a 4K TV alike — a fixed em height would be pinned to the inherited 16px root instead. */}
+     {config.showTicker&&<div className="flex-none flex items-stretch overflow-hidden whitespace-nowrap border-b border-ticker-line bg-ticker-panel font-ticker-display font-bold text-[length:clamp(11px,1.7vh,22px)] leading-none" aria-label="Aktuelle Kurse">
+@@ -335,7 +310,7 @@ function MarketDisplay(){
+             <div className="flex flex-col">{items.map(p=><MarketRow key={p.id} product={p} history={history} charts={config.showCharts}/>)}</div>
+           </section>)}
+         </div>)}
+-        {!groups.length&&<div className="flex-1 flex items-center justify-center text-ticker-muted text-[length:clamp(16px,2.6vh,34px)]">Keine Getränke in dieser Kategorie</div>}
++        {!groups.length&&<div className="flex-1 flex items-center justify-center text-ticker-muted text-[length:clamp(16px,2.6vh,34px)]">{stale?'Kurse werden geladen …':'Keine Getränke in dieser Kategorie'}</div>}
+       </section>
+       {showFocusCard&&spot&&focusProduct&&(
+         <aside className={`grow-[1] basis-0 min-w-0 flex flex-col border-ticker-line ${handheld?'border-t pt-[1.8vh]':'border-l pl-[2vw] min-h-0 overflow-hidden'}`}>
+@@ -343,23 +318,7 @@ function MarketDisplay(){
+         </aside>
+       )}
+     </div>
+-    <BoardFooter note={footerNote||undefined} online={Boolean(health?.ok)}/>
+-    <MomentOverlay moment={moment}/>
+-    {config.sound&&<>
+-      <audio ref={audio.crashRef} preload="auto" className="hidden" aria-hidden="true">
+-        <source src="/sounds/crash-alarm.mp3?v=44100-1" type="audio/mpeg"/>
+-      </audio>
+-      <audio ref={audio.testRef} preload="auto" className="hidden" aria-hidden="true">
+-        <source src="/sounds/test-tone.mp3" type="audio/mpeg"/>
+-      </audio>
+-      {/* Only ever shown while audio is actually blocked: a silent display looks identical to a
+-          working one otherwise, and a muted crash alarm is not something anyone notices in time. */}
+-      {audio.status==='blocked'&&<button autoFocus={audio.needsUnlockPrompt} type="button" onClick={()=>void(audio.unlock())}
+-        className="fixed bottom-[4vh] left-[3.3vw] z-30 flex items-center gap-[0.8vw] rounded-full border border-ticker-down/60 bg-black/70 px-[1.2vw] py-[0.7vh] text-[length:clamp(11px,1.6vh,22px)] font-semibold text-ticker-down focus:outline-none focus-visible:ring-2 focus-visible:ring-ticker-down"
+-        title={audio.message} aria-label={audio.message}>
+-        <span className="inline-block size-[1.1vh] min-h-2 min-w-2 rounded-full bg-ticker-down"/>Ton aus — beliebige Taste drücken
+-      </button>}
+-      {audio.status==='error'&&<div role="alert" className="fixed bottom-[5vh] left-[3.3vw] z-30 max-w-[70vw] text-[length:clamp(11px,1.5vh,20px)] text-ticker-down">{audio.message}</div>}
+-    </>}
++    <BoardFooter note={footerNote||undefined} online={!stale&&Boolean(health?.ok)}/>
++    <MomentOverlay moment={!stale&&health?.ok&&phase==='OPEN'&&mode==='NORMAL'&&(moment?.tone!=='crash'||crashLeft>0)?moment:null}/>
+   </main>;
+ }
+diff --git a/apps/web/src/api.ts b/apps/web/src/api.ts
+index 45f562c..7fc6b26 100644
+--- a/apps/web/src/api.ts
++++ b/apps/web/src/api.ts
+@@ -19,26 +19,29 @@ export class Api{
+   session(){return this.call<{username:string;roles:string[];terminalId:string}>('/auth/me')}
+   login(username:string,password:string,terminalId:string){return this.call<{accessToken:string}>('/auth/login',{method:'POST',body:JSON.stringify({username,password,terminalId})})}
+   lookupWallet(identifier:string){return this.call<WalletIdentity>('/wallets/lookup',{method:'POST',body:JSON.stringify({uid:identifier})})}
++  grantFreeDrink(uid:string,expectedWalletId:string){return this.call<WalletIdentity>('/wallets/free-drink',{method:'POST',body:JSON.stringify({uid,expectedWalletId})})}
+   walletHistory(identifier:string){return this.call<{wallet:WalletIdentity;entries:HistoryEntry[];truncated?:boolean}>('/wallets/history',{method:'POST',body:JSON.stringify({uid:identifier})})}
+   blockWristband(identifier:string,reason:string){return this.call<any>('/wristbands/block',{method:'POST',body:JSON.stringify({uid:identifier,reason})})}
+   products(){return this.call<Product[]>('/products')}
+   subscribeProducts(receive:(products:Product[])=>void){const socket=io('/market',{path:'/api/socket.io',transports:['websocket']});socket.on('prices',receive);return()=>socket.disconnect()}
+-  marketHistory(){return this.call<MarketHistory>('/market/history')}
++  marketHistory(signal?:AbortSignal){return this.call<MarketHistory>('/market/history',{signal,cache:'no-store'})}
+   quote(items:{productId:string;quantity:number}[]){return this.call<Quote>('/quotes',{method:'POST',body:JSON.stringify({items})})}
+-  purchase(uid:string,quoteId:string,idempotencyKey:string=uuid(),expectedWalletId?:string){return this.call<any>('/purchases',{method:'POST',headers:{'Idempotency-Key':idempotencyKey},body:JSON.stringify({uid,quoteId,expectedWalletId})})}
++  purchase(uid:string,quoteId:string,idempotencyKey:string=uuid(),expectedWalletId?:string,freeDrink?:true){return this.call<any>('/purchases',{method:'POST',headers:{'Idempotency-Key':idempotencyKey},body:JSON.stringify({uid,quoteId,expectedWalletId,freeDrink})})}
+   topup(uid:string,amountCents:number,fundingMethod:'CASH'|'CARD_VERIFIED',paymentReference?:string,idempotencyKey:string=uuid(),expectedWalletId?:string){return this.call<any>('/topups',{method:'POST',headers:{'Idempotency-Key':idempotencyKey},body:JSON.stringify({uid,amountCents,fundingMethod,paymentReference,expectedWalletId})})}
+   cancelTransaction(key:string,type:'TOPUP'|'PURCHASE'){return this.call<{status:string;response:any}>(`/transactions/${encodeURIComponent(key)}/cancel`,{method:'POST',body:JSON.stringify({type})})}
+   transactionStatus(idempotencyKey:string){return this.call<{type:string;status:string;createdAt:number;committedAt:number|null;response:any}>(`/transactions/${encodeURIComponent(idempotencyKey)}`)}
+   health(){return this.call<any>('/operations/health')}
+   startCrash(minutes:number,kind:'CRASH'|'AUSVERKAUF'){return this.call<any>('/market/crash',{method:'POST',body:JSON.stringify({minutes,kind})})}
+   stopCrash(){return this.call<any>('/market/crash/stop',{method:'POST',body:'{}'})}
+-  cashSession(){return this.call<any>('/operations/cash-session')}
++  cashSession(){return this.call<OpenCashSession|null>('/operations/cash-session')}
++  cashSessions(){return this.call<OpenCashSession[]>('/operations/cash-sessions')}
+   openCashSession(openingCashCents:number){return this.call<any>('/operations/cash-session/open',{method:'POST',body:JSON.stringify({openingCashCents})})}
+-  closeCashSession(countedCashCents:number,reason?:string){return this.call<any>('/operations/cash-session/close',{method:'POST',body:JSON.stringify({countedCashCents,reason})})}
++  closeCashSession(sessionId:string,expectedCashCents:number,countedCashCents:number,reason?:string){return this.call<{differenceCents:number}>('/operations/cash-session/close',{method:'POST',body:JSON.stringify({sessionId,expectedCashCents,countedCashCents,reason})})}
+   report(){return this.call<any>('/operations/report')}
+   eventState(){return this.call<EventState>('/operations/event')}
+   openEvent(name:string){return this.call<EventState>('/operations/event/open',{method:'POST',body:JSON.stringify({name})})}
+   beginEventClosing(){return this.call<EventState>('/operations/event/begin-closing',{method:'POST',body:'{}'})}
++  backEvent(expectedPhase:EventPhase){return this.call<EventState>('/operations/event/back',{method:'POST',body:JSON.stringify({expectedPhase})})}
+   closeEvent(){return this.call<EventState>('/operations/event/close',{method:'POST',body:'{}'})}
+   approvals(){return this.call<any[]>('/approvals')}
+   requestRefund(orderId:string,reason:string,amountCents?:number){return this.approvalRequest('/approvals/refunds',{orderId,reason,amountCents})}
+@@ -60,7 +63,7 @@ export class Api{
+   createProduct(input:ProductInput){return this.call<AdminProduct>('/admin/products',{method:'POST',body:JSON.stringify(input)})}
+   updateProduct(id:string,patch:Partial<ProductInput&{active:boolean;soldOut:boolean}>){return this.call<AdminProduct>(`/admin/products/${id}`,{method:'PATCH',body:JSON.stringify(patch)})}
+   wristbands(){return this.call<Wristband[]>('/wristbands')}
+-  registerWristband(input:{bandNumber:string;kind:'NFC'|'TYVEK';uid?:string;initialBalanceCents:number}){return this.call<Wristband>('/wristbands/register',{method:'POST',body:JSON.stringify(input)})}
++  registerWristband(input:{bandNumber:string;kind:'NFC'|'TYVEK';uid?:string;initialBalanceCents:number;freeDrink?:boolean}){return this.call<Wristband>('/wristbands/register',{method:'POST',body:JSON.stringify(input)})}
+   async importWristbands(file:File){const form=new FormData();form.append('file',file);const r=await fetch(`${base}/admin/wristbands/import`,{method:'POST',headers:this.token?{Authorization:`Bearer ${this.token}`}:{},body:form});const text=await r.text();let body:any=null;if(text){try{body=JSON.parse(text)}catch{body={}}}if(!r.ok)throw new Error(body?.message??body?.code??`HTTP ${r.status}`);return body as{imported:number;errors:string[]}}
+   deviceHeartbeat(deviceId:string,info:{name?:string;userAgent?:string;screenWidth?:number;screenHeight?:number}){return this.call<{ok:true}>(`/devices/${deviceId}/heartbeat`,{method:'POST',body:JSON.stringify(info)})}
+   reportDiagnostic(deviceId:string,result:DiagnosticResult){return this.call<{ok:true}>(`/devices/${deviceId}/diagnostic-result`,{method:'POST',body:JSON.stringify(result)})}
+@@ -74,22 +77,23 @@ export class Api{
+   getPendingCharge(terminalId:string){return this.call<PendingCharge|{type:null}>(`/terminals/${terminalId}/pending-charge`)}
+   clearPendingCharge(terminalId:string,quoteId?:string){return this.call<{ok:boolean}>(`/terminals/${terminalId}/pending-charge${quoteId?'?quoteId='+encodeURIComponent(quoteId):''}`,{method:'DELETE'})}
+ }
+-export type Product={id:string;name:string;category:string;priceCents:number;minPriceCents:number;maxPriceCents:number;soldOut:boolean;version:number};export type MarketPoint={version:number;effectiveAt:number;prices:Record<string,number>};export type MarketHistory={points:MarketPoint[]};export type Quote={quoteId:string;totalCents:number;expiresAt:number;items:{productId:string;quantity:number;name:string;unitPriceCents:number}[]};
+-export type WalletIdentity={walletId:string;balanceCents:number;status:string;bandNumber:string;uidHex:string|null;kind:'NFC'|'TYVEK'};
++export type Product={id:string;name:string;category:string;priceCents:number;basePriceCents?:number;minPriceCents:number;maxPriceCents:number;soldOut:boolean;version:number};export type MarketPoint={version:number;effectiveAt:number;prices:Record<string,number>};export type MarketHistory={points:MarketPoint[];snapshot?:{products:Product[];health:{ok:boolean;state:any};serverTime:number}};export type Quote={quoteId:string;totalCents:number;expiresAt:number;items:{productId:string;quantity:number;name:string;unitPriceCents:number}[]};
++export type WalletIdentity={walletId:string;balanceCents:number;status:string;bandNumber:string;uidHex:string|null;kind:'NFC'|'TYVEK';freeDrinkStatus?:'NONE'|'AVAILABLE'|'REDEEMED'};
+ export type EventPhase='PREPARING'|'OPEN'|'CLOSING'|'CLOSED';
+ export type ChecklistItem={id:string;label:string;required:boolean;ok:boolean;detail:string};
++export type OpenCashSession={id:string;terminalId:string;terminalName:string;operatorId:string;operatorName:string;openedAt:number;openingCashCents:number;movementsCents:number;expectedCashCents:number};
+ export type EventState={
+   phase:EventPhase;name:string|null;openedAt:number|null;closedAt:number|null;mode:string;
+   checklist:ChecklistItem[];
+-  closing:{openCashSessions:{id:string;terminalId:string;openedAt:number;openingCashCents:number}[];outstandingWallets:number;outstandingCents:number;pendingOperations:number;pendingApprovals:number};
++  closing:{openCashSessions:{id:string;terminalId:string;terminalName:string;openedAt:number;openingCashCents:number}[];outstandingWallets:number;outstandingCents:number;pendingOperations:number;pendingApprovals:number};
+ };
+ export type HistoryEntry=
+-  |{type:'PURCHASE';id:string;amountCents:number;status:string;createdAt:number;refundableCents:number}
++  |{type:'PURCHASE';id:string;amountCents:number;status:string;createdAt:number;refundableCents:number;freeDrink?:boolean}
+   |{type:'TOPUP';id:string;amountCents:number;status:string;createdAt:number;fundingMethod:'CASH'|'CARD_VERIFIED';paymentReference:string|null}
+   |{type:'REFUND';id:string;orderId:string;amountCents:number;createdAt:number;reason:string};
+ export type ProductInput={name:string;category:string;basePriceCents:number;minPriceCents:number;maxPriceCents:number};
+ export type AdminProduct=ProductInput&{id:string;active:boolean;soldOut:boolean;currentPriceCents:number|null};
+-export type Wristband={id:string;bandNumber:string;uidHex:string|null;kind:'NFC'|'TYVEK';status:'IMPORTED'|'ACTIVE'|'BLOCKED'|'RETIRED';createdAt:number;balanceCents:number|null;initialBalanceCents:number};
++export type Wristband={id:string;bandNumber:string;uidHex:string|null;kind:'NFC'|'TYVEK';status:'IMPORTED'|'ACTIVE'|'BLOCKED'|'RETIRED';createdAt:number;balanceCents:number|null;initialBalanceCents:number;freeDrinkStatus?:'NONE'|'AVAILABLE'|'REDEEMED'};
+ export type PendingCharge=
+   |{type:'purchase';quoteId:string;totalCents:number;items:{name:string;quantity:number;unitPriceCents:number}[]}
+   |{type:'topup';amountCents:number;fundingMethod:'CASH'|'CARD_VERIFIED';paymentReference?:string};
+diff --git a/apps/web/src/market-config.test.ts b/apps/web/src/market-config.test.ts
+index a3225a8..ff71ced 100644
+--- a/apps/web/src/market-config.test.ts
++++ b/apps/web/src/market-config.test.ts
+@@ -3,9 +3,11 @@ import { parseMarketDisplayConfig } from './market-config';
+ 
+ describe('market display URL configuration',()=>{
+   it('uses a television-safe 16:9 default',()=>{
+-    expect(parseMarketDisplayConfig('')).toMatchObject({format:'16x9',categoryColumns:2,scale:1,overscan:2,refreshMs:1000,showCharts:true,showTicker:false,showFocus:true,sound:true});
++    expect(parseMarketDisplayConfig('')).toMatchObject({format:'16x9',categoryColumns:2,scale:1,overscan:2,refreshMs:1000,showCharts:true,showTicker:false,showFocus:true,sound:false});
+   });
+ 
++  it('does not enable audio even via an old link',()=>{expect(parseMarketDisplayConfig('?sound=1').sound).toBe(false)});
++
+   it('gives an ultrawide screen a third drink column, which 16:9 has no room for',()=>{
+     expect(parseMarketDisplayConfig('?format=21:9').categoryColumns).toBe(3);
+     expect(parseMarketDisplayConfig('?format=16:9&columns=3').categoryColumns).toBe(3);
+diff --git a/apps/web/src/market-config.ts b/apps/web/src/market-config.ts
+index e9a93c0..3bac9c8 100644
+--- a/apps/web/src/market-config.ts
++++ b/apps/web/src/market-config.ts
+@@ -36,7 +36,7 @@ export function parseMarketDisplayConfig(search:string):MarketDisplayConfig{
+     showCharts:params.get('charts')!=='0',
+     showTicker:params.get('ticker')==='1',
+     showFocus:params.get('focus')!=='0',
+-    sound:params.get('sound')!=='0',
++    sound:false,
+     category:category||undefined,
+   };
+ }
+diff --git a/apps/web/src/market/parts.tsx b/apps/web/src/market/parts.tsx
+index 53e5f09..c98a07b 100644
+--- a/apps/web/src/market/parts.tsx
++++ b/apps/web/src/market/parts.tsx
+@@ -71,9 +71,10 @@ export function Sparkline({ history, product, color, lineWidth = 2 }: { history:
+       g.lineTo(lastX, h); g.lineTo(lineWidth, h); g.closePath();
+       const gr = g.createLinearGradient(0, 0, 0, h); gr.addColorStop(0, color + '44'); gr.addColorStop(1, color + '00');
+       g.fillStyle = gr; g.fill();
+-      g.fillStyle = color; g.beginPath(); g.arc(lastX, y(hist.at(-1) as number), lineWidth * 1.6, 0, 7); g.fill();
++      g.fillStyle = color; g.beginPath(); g.arc(lastX, y(hist[hist.length-1]), lineWidth * 1.6, 0, 7); g.fill();
+     };
+     draw();
++    if(typeof ResizeObserver==='undefined'){window.addEventListener('resize',draw);return()=>window.removeEventListener('resize',draw)}
+     const ro = new ResizeObserver(draw); ro.observe(cv);
+     return () => ro.disconnect();
+   }, [series.join(','), base, color, lineWidth]);
+@@ -89,6 +90,7 @@ export function MarqueeText({ text }: { text: string }) {
+     const outer = outerRef.current, inner = innerRef.current; if (!outer || !inner) return;
+     const measure = () => { const diff = inner.scrollWidth - outer.clientWidth; setOverflow(diff > 2 ? diff : 0) };
+     measure();
++    if(typeof ResizeObserver==='undefined'){window.addEventListener('resize',measure);return()=>window.removeEventListener('resize',measure)}
+     const ro = new ResizeObserver(measure); ro.observe(outer); ro.observe(inner);
+     return () => ro.disconnect();
+   }, [text]);
+@@ -132,11 +134,11 @@ const ROW_HISTORY_POINTS = 24;
+ export function MarketRow({ product, history, charts }: { product: Product; history: MarketPoint[]; charts: boolean }) {
+   const recent = history.length > ROW_HISTORY_POINTS ? history.slice(-ROW_HISTORY_POINTS) : history;
+   const { percent, up, fixed, color } = marketTrend(product, recent), flat = !fixed && Math.round(percent) === 0, roll = usePriceRoll(product.priceCents);
+-  if (product.soldOut) return <article className={`${ROW_BASE} opacity-[0.32]`}>
++  if (product.soldOut) return <article className={`${ROW_BASE} opacity-70`}>
+     <h3 className={ROW_NAME}><DrinkName name={product.name} /></h3>
+     {charts && <div className={ROW_CHART} />}
+     <div className={ROW_TREND} />
+-    <strong className={`${ROW_PRICE} text-[length:calc(var(--u,36px)*0.26)] font-semibold text-ticker-muted`}><span>ausverkauft</span></strong>
++    <strong className={`${ROW_PRICE} text-[length:calc(var(--u,36px)*0.26)] font-semibold text-ticker-down`}><span>ausverkauft</span></strong>
+   </article>;
+   return <article className={ROW_BASE}>
+     <h3 className={ROW_NAME}><DrinkName name={product.name} /></h3>
+diff --git a/apps/web/src/pay-display/PayDisplayPage.tsx b/apps/web/src/pay-display/PayDisplayPage.tsx
+index 0a4120b..66028da 100644
+--- a/apps/web/src/pay-display/PayDisplayPage.tsx
++++ b/apps/web/src/pay-display/PayDisplayPage.tsx
+@@ -67,15 +67,14 @@ function DisplayRuntime({ api }: { api: Api }) {
+   const terminalId = api.terminalId();
+   const [charge, setCharge] = useState<PendingCharge | null>(null);
+   const [flash, setFlash] = useState<Flash | null>(null);
+-  const [manualUid, setManualUid] = useState('');
+   const submittingRef = useRef(false);
+   const chargeRef = useRef<PendingCharge | null>(null);
+   chargeRef.current = charge;
+ 
+   useEffect(() => {
+     if (!terminalId) return;
+-    let active = true;
+-    const poll = async () => { try { const c = await api.getPendingCharge(terminalId); if (active) setCharge(c && (c as any).type ? c as PendingCharge : null) } catch { /* keep trying */ } };
++    let active = true,inFlight=false;
++    const poll = async () => {if(inFlight)return;inFlight=true;try { const c = await api.getPendingCharge(terminalId); if (active) setCharge(c && (c as any).type ? c as PendingCharge : null) } catch {if(active)setCharge(null)}finally{inFlight=false} };
+     void poll();
+     const t = setInterval(poll, 1200);
+     return () => { active = false; clearInterval(t) };
+@@ -83,10 +82,9 @@ function DisplayRuntime({ api }: { api: Api }) {
+ 
+   async function attemptPay(uid: string) {
+     const current = chargeRef.current;
+-    if (!current || submittingRef.current || !terminalId) return;
++    if (!current || current.type!=='purchase' || submittingRef.current || !terminalId) return;
+     submittingRef.current = true;
+     try {
+-      if(current.type!=='purchase')throw new Error('Aufladungen müssen an der besetzten Kasse bestätigt werden.');
+       const key=current.quoteId;
+       let result:any;
+       // Always check the original key first, also after a reload or interrupted response.
+@@ -96,7 +94,7 @@ function DisplayRuntime({ api }: { api: Api }) {
+       setFlash({tone:'green',headline:euro(result.totalCents),sub:'Zahlung gebucht'});
+       // A failed display reset must never turn a confirmed debit into a red failure.
+       await api.clearPendingCharge(terminalId,current.quoteId).catch(()=>{});
+-      setCharge(null);setManualUid('');
++      setCharge(null);
+     } catch (e) {
+       setFlash({tone:'red',headline:'Kasse informieren',sub:(e as Error).message});
+     } finally {submittingRef.current=false;setTimeout(()=>setFlash(null),3500);}
+@@ -108,16 +106,16 @@ function DisplayRuntime({ api }: { api: Api }) {
+   }, [api, terminalId]);
+   useEffect(() => {
+     if (typeof window === 'undefined' || !('NDEFReader' in window) || !window.isSecureContext) return;
+-    let cancelled = false;
++    let cancelled = false;const controller=new AbortController();
+     (async () => {
+       try {
+         const reader = new window.NDEFReader!();
+-        await reader.scan();
++        await reader.scan({signal:controller.signal});
+         if (cancelled) return;
+         reader.onreading = (e: any) => { const raw = String(e.serialNumber ?? '').replace(/[:-]/g, '').toUpperCase(); if (raw) void attemptPay(raw) };
+       } catch { /* no NFC hardware / permission denied — manual entry still works below */ }
+     })();
+-    return () => { cancelled = true };
++    return () => { cancelled = true;controller.abort() };
+   }, []);
+ 
+   if (flash) return (
+@@ -161,15 +159,9 @@ function DisplayRuntime({ api }: { api: Api }) {
+               <span className="absolute -inset-[3px] rounded-full border-[3px] border-ticker-gold opacity-0 animate-ticker-ping [animation-delay:1.1s]" />
+               <span className="absolute inset-[0.9em] -rotate-12 rounded-[0.3em] border-[3px] border-ticker-fg" />
+             </div>
+-            <div><p className="font-ticker-display text-[length:clamp(18px,3vh,30px)] font-bold">Jetzt Armband auflegen</p><p className="mt-1 text-[length:clamp(12px,1.7vh,17px)] text-ticker-muted">Erst danach wird der Vorgang abgeschlossen.</p></div>
+-          </div>
+-          <div className="mt-[1.4vh] flex flex-wrap items-center justify-center gap-[0.6em] text-[length:clamp(12px,1.5vh,16px)] opacity-45">
+-            <span>Oder Armbandnummer:</span>
+-            <input value={manualUid} onChange={e => setManualUid(e.target.value)} onKeyDown={e => e.key === 'Enter' && manualUid && attemptPay(manualUid)}
+-              className="bg-transparent border border-ticker-line rounded-[0.4em] text-ticker-fg px-[0.6em] py-[0.3em] w-[9em] text-center font-[inherit]" />
+-            <button disabled={!manualUid} onClick={() => attemptPay(manualUid)}
+-              className="bg-transparent border border-ticker-line rounded-[0.4em] text-ticker-fg px-[0.9em] py-[0.3em] font-[inherit] cursor-pointer disabled:cursor-not-allowed disabled:opacity-50">Bestätigen</button>
++            <div><p className="font-ticker-display text-[length:clamp(18px,3vh,30px)] font-bold">{charge.type==='purchase'?'Jetzt Armband auflegen':'Zahlung an der Kasse bestätigen'}</p><p className="mt-1 text-[length:clamp(12px,1.7vh,17px)] text-ticker-muted">{charge.type==='purchase'?'Erst danach wird der Vorgang abgeschlossen.':'Das Personal bucht die Aufladung.'}</p></div>
+           </div>
++          <p className="mt-3 text-center text-sm text-ticker-muted">Armband kann nicht gelesen werden? Bitte an die Kasse wenden.</p>
+         </main>
+       ) : (
+         <div className="flex h-full flex-col items-center justify-center gap-[2vh] px-6 text-center">
+diff --git a/apps/web/src/terminal/TerminalApp.tsx b/apps/web/src/terminal/TerminalApp.tsx
+index 055a3af..1d8777b 100644
+--- a/apps/web/src/terminal/TerminalApp.tsx
++++ b/apps/web/src/terminal/TerminalApp.tsx
+@@ -3,7 +3,7 @@ import { toast } from 'sonner';
+ import {
+   Beer, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Cpu, CreditCard, Home, Landmark, Lightbulb, LineChart, Loader2, Lock, LogOut, Menu, Minus, MoreHorizontal, Nfc, Plus, Receipt, Repeat, Settings2, ShieldCheck, Unlock, Users, Wallet,
+ } from 'lucide-react';
+-import { Api, ApiError, type AdminProduct, type ChipDevice, type DeviceRecord, type EventPhase, type EventState, type HistoryEntry, type Product, type Quote, type WalletIdentity, type Wristband, uuid } from '@/api';
++import { Api, ApiError, type AdminProduct, type ChipDevice, type DeviceRecord, type EventPhase, type EventState, type OpenCashSession, type HistoryEntry, type Product, type Quote, type WalletIdentity, type Wristband, uuid } from '@/api';
+ import { Button, buttonVariants } from '@/components/ui/button';
+ import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '@/components/ui/alert-dialog';
+ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
+@@ -20,7 +20,7 @@ import { Toaster } from '@/components/ui/sonner';
+ import { euro, feedback, scannerValue, toCents } from './feedback';
+ import { BoundBandBar, NfcScanField, nfcSupported, useNfcScanner } from './nfc';
+ 
+-type PendingOperation = { type: 'purchase'; expectedWalletId?:string; operatorId?:string; terminalId?:string; key: string; uid: string; quoteId: string } | { type: 'topup'; expectedWalletId?:string; operatorId?:string; terminalId?:string; key: string; uid: string; amountCents: number; fundingMethod: 'CASH' | 'CARD_VERIFIED'; paymentReference?: string };
++type PendingOperation = { type: 'purchase'; expectedWalletId?:string; operatorId?:string; terminalId?:string; key: string; uid: string; quoteId: string; freeDrink?:true } | { type: 'topup'; expectedWalletId?:string; operatorId?:string; terminalId?:string; key: string; uid: string; amountCents: number; fundingMethod: 'CASH' | 'CARD_VERIFIED'; paymentReference?: string };
+ const loadPending = () => { try { return JSON.parse(localStorage.getItem('pending-operation') ?? 'null') as PendingOperation | null } catch { return null } };
+ 
+ type View = 'home' | 'pos' | 'topup' | 'customer' | 'products' | 'market' | 'ops';
+@@ -83,7 +83,7 @@ export default function TerminalApp() {
+   const api = useMemo(() => new Api(), []);
+   const [authenticated, setAuthenticated] = useState(api.hasToken());
+   const [roles,setRoles]=useState(()=>api.roles());
+-  const [view, setView] = useState<View>('home');
++  const [view, setCurrentView] = useState<View>('home');
+   const [uid, setUid] = useState('');
+   const [products, setProducts] = useState<Product[]>([]);
+   const [cart, setCart] = useState<Record<string, number>>({});
+@@ -100,6 +100,7 @@ export default function TerminalApp() {
+   const scanLocked = useRef(false);
+   const keyboardScannerRef = useRef({ value: '', lastKeyAt: 0 });
+   const lastScanRef = useRef({ value: '', at: 0 });
++  function setView(next:View){if(submittingRef.current||next===view)return;scanLocked.current=false;setUid('');setCart({});setCurrentView(next)}
+   function toggleCollapsed() { setCollapsed(c => { localStorage.setItem('sidebar-collapsed', c ? '0' : '1'); return !c }) }
+ 
+   // A wristband held against the phone fires repeatedly while it rests there; without this
+@@ -127,7 +128,8 @@ export default function TerminalApp() {
+   useEffect(() => {
+     if (!authenticated || (view !== 'pos' && view !== 'topup' && view !== 'customer')) return;
+     const onKeyDown = (event: KeyboardEvent) => {
+-      if (event.ctrlKey || event.metaKey || event.altKey) return;
++      if (event.ctrlKey || event.metaKey || event.altKey || scanLocked.current || submittingRef.current || pendingRef.current) return;
++      const focused=event.target as HTMLElement|null;if(focused?.closest('input,textarea,select,button,[contenteditable=true]'))return;
+       const scanner = keyboardScannerRef.current;
+       const now = Date.now();
+       if (event.key === 'Enter' || event.code === 'NumpadEnter') {
+@@ -173,7 +175,7 @@ export default function TerminalApp() {
+     if((x.operatorId&&x.operatorId!==api.operatorId())||(x.terminalId&&x.terminalId!==api.terminalId()))throw new Error('Mit dem ursprünglichen Mitarbeiter am ursprünglichen Terminal anmelden.');
+     try {
+       const result = x.type === 'purchase'
+-        ? await api.purchase(x.uid, x.quoteId, x.key, x.expectedWalletId)
++        ? await api.purchase(x.uid, x.quoteId, x.key, x.expectedWalletId,x.freeDrink)
+         : await api.topup(x.uid, x.amountCents, x.fundingMethod ?? 'CASH', x.paymentReference, x.key, x.expectedWalletId);
+       if(result?.status!=='COMMITTED'||!result.operationId||!Number.isInteger(result.balanceCents))throw new Error('Buchungsbestätigung fehlt');
+       remember(null);
+@@ -185,7 +187,7 @@ export default function TerminalApp() {
+         if(status.status==='REJECTED')remember(null);
+       } catch (statusError) {
+         // Only a known server-side rejection plus an authoritative NOT_FOUND permits abandoning the key.
+-        if(statusError instanceof ApiError && statusError.code==='TRANSACTION_NOT_FOUND' && originalError instanceof ApiError && ['CASH_SESSION_REQUIRED','LEDGER_MISCONFIGURED','EVENT_NOT_OPEN','PAYMENT_STOP','INVALID_AMOUNT','INSUFFICIENT_FUNDS','QUOTE_INVALID','WALLET_CHANGED','WALLET_UNAVAILABLE','WRISTBAND_NOT_ACTIVE','PAYMENT_REFERENCE_REUSED','AMBIGUOUS_UID'].includes(originalError.code??'')){
++        if(statusError instanceof ApiError && statusError.code==='TRANSACTION_NOT_FOUND' && originalError instanceof ApiError && ['CASH_SESSION_REQUIRED','LEDGER_MISCONFIGURED','EVENT_NOT_OPEN','PAYMENT_STOP','INVALID_AMOUNT','INSUFFICIENT_FUNDS','QUOTE_INVALID','WALLET_CHANGED','WALLET_UNAVAILABLE','WRISTBAND_NOT_ACTIVE','PAYMENT_REFERENCE_REUSED','AMBIGUOUS_UID','FREE_DRINK_UNAVAILABLE','FREE_DRINK_ITEM','PRODUCT_SOLD_OUT','PRODUCT_UNAVAILABLE'].includes(originalError.code??'')){
+           // Atomically reserve the failed key before clearing it; delayed requests cannot book it.
+           try{const cancelled=await api.cancelTransaction(x.key,x.type==='topup'?'TOPUP':'PURCHASE');if(cancelled.status==='COMMITTED'&&cancelled.response?.operationId&&Number.isInteger(cancelled.response.balanceCents)){remember(null);return cancelled.response}if(cancelled.status==='REJECTED')remember(null)}catch{/* keep pending if reservation cannot be confirmed */}
+         }
+@@ -194,11 +196,11 @@ export default function TerminalApp() {
+     }
+   }
+ 
+-  async function pay(quoteId: string, wallet:WalletIdentity) {
++  async function pay(quoteId: string, wallet:WalletIdentity,freeDrink?:true) {
+     if (pendingRef.current || loadPending() || submittingRef.current) throw new Error('Zuerst den ungeklärten Vorgang prüfen.');
+     submittingRef.current = true; setBusy(true);
+     try {
+-      const x: PendingOperation = { type: 'purchase', key: uuid(), uid:wallet.uidHex??wallet.bandNumber, expectedWalletId:wallet.walletId,operatorId:api.operatorId(),terminalId:api.terminalId(), quoteId };
++      const x: PendingOperation = { type: 'purchase', key: uuid(), uid:wallet.uidHex??wallet.bandNumber, expectedWalletId:wallet.walletId,operatorId:api.operatorId(),terminalId:api.terminalId(), quoteId,freeDrink };
+       remember(x); return await execute(x);
+     } finally { submittingRef.current = false; setBusy(false) }
+   }
+@@ -216,9 +218,9 @@ export default function TerminalApp() {
+     const x=pendingRef.current;if(!x||submittingRef.current)return;
+     submittingRef.current=true;setBusy(true);
+     try {
+-      if(retry){const result=await execute(x);toast.success(`Gebucht · Guthaben ${euro(result.balanceCents)}`);setUid('');setCart({});setView('home');return;}
++      if(retry){const result=await execute(x);toast.success(`Gebucht · Guthaben ${euro(result.balanceCents)}`);setUid('');setCart({});scanLocked.current=false;setCurrentView('home');return;}
+       const status=cancel?await api.cancelTransaction(x.key,x.type==='topup'?'TOPUP':'PURCHASE'):await api.transactionStatus(x.key);
+-      if(status.status==='COMMITTED'&&status.response?.operationId){remember(null);toast.success(`Bereits gebucht · Guthaben ${euro(status.response.balanceCents)}`);setUid('');setCart({});setView('home');}
++      if(status.status==='COMMITTED'&&status.response?.operationId){remember(null);toast.success(`Bereits gebucht · Guthaben ${euro(status.response.balanceCents)}`);setUid('');setCart({});scanLocked.current=false;setCurrentView('home');}
+       else if(status.status==='REJECTED'){remember(null);toast.info('Buchung abgelehnt.');}
+       else toast.warning('Buchung noch nicht geklärt.');
+     } catch(e){toast.error(e instanceof ApiError&&e.code==='TRANSACTION_NOT_FOUND'?'Nicht gebucht gefunden. Nur bei bestätigter Zahlung mit demselben Schlüssel erneut senden.':(e as Error).message);}
+@@ -554,26 +556,28 @@ function ProductTile({ product, quantity, onAdd, onRemove }: { product: Product;
+ function PosView({ uid, setUid, products, cart, setCart, onPay, disabled, busy, api, setView, nfc, terminalName, scanLocked }: {
+   uid: string; setUid: (value: string) => void; products: Product[]; cart: Record<string, number>;
+   setCart: (change: (cart: Record<string, number>) => Record<string, number>) => void;
+-  onPay: (quoteId: string, wallet:WalletIdentity) => Promise<any>; scanLocked:{current:boolean}; disabled: boolean; busy: boolean; api: Api; setView: (v: View) => void;
++  onPay: (quoteId: string, wallet:WalletIdentity,freeDrink?:true) => Promise<any>; scanLocked:{current:boolean}; disabled: boolean; busy: boolean; api: Api; setView: (v: View) => void;
+   nfc: ReturnType<typeof useNfcScanner>; terminalName: string;
+ }) {
+   const [wallet, setWallet] = useState<WalletIdentity | null>(null);
+   const [stage, setStage] = useState<'scan' | 'order' | 'confirm' | 'success'>('scan');
+   const [quote, setQuote] = useState<Quote | null>(null);
++  const [freeDrink,setFreeDrink]=useState(false);
+   const [quoting, setQuoting] = useState(false);
+   const quoteGeneration=useRef(0);const successTimer=useRef<number|undefined>(undefined);useEffect(()=>()=>{window.clearTimeout(successTimer.current)},[]);
+   const [charging, setCharging] = useState(false);
+-  const [receipt, setReceipt] = useState<{ totalCents: number; balanceCents: number } | null>(null);
++  const [receipt, setReceipt] = useState<{ totalCents: number; balanceCents: number;freeDrink?:boolean } | null>(null);
+   const [error, setError] = useState('');
+ 
+   const itemCount = Object.values(cart).reduce((sum, quantity) => sum + quantity, 0);
+   const localTotal = products.reduce((sum, product) => sum + product.priceCents * (cart[product.id] ?? 0), 0);
+-  const total = quote?.totalCents ?? localTotal;
++  const useFree=freeDrink&&wallet?.freeDrinkStatus==='AVAILABLE'&&itemCount===1&&(quote?.totalCents??localTotal)>0;
++  const total = useFree?0:quote?.totalCents ?? localTotal;
+   const categories = [...new Set(products.map(product => product.category))];
+   const remaining = (wallet?.balanceCents ?? 0) - total;
+   const missing = Math.max(0, -remaining);
+ 
+-  function reset() { quoteGeneration.current++;setQuoting(false);scanLocked.current=false; setCart(() => ({})); setUid(''); setWallet(null); setQuote(null); setError(''); setStage('scan') }
++  function reset() { setFreeDrink(false);quoteGeneration.current++;setQuoting(false);scanLocked.current=false; setCart(() => ({})); setUid(''); setWallet(null); setQuote(null); setError(''); setStage('scan') }
+ 
+   useEffect(()=>()=>{scanLocked.current=false},[scanLocked]);
+   function bind(found: WalletIdentity | null) {
+@@ -587,7 +591,7 @@ function PosView({ uid, setUid, products, cart, setCart, onPay, disabled, busy,
+     if(charging||busy||quoting)return;
+     const next={...cart};const quantity=Math.max(0,Math.min(20,(next[productId]??0)+delta));
+     if(quantity)next[productId]=quantity;else delete next[productId];
+-    setCart(()=>next);setQuote(null);
++    setCart(()=>next);setQuote(null);setFreeDrink(false);
+     if(stage==='confirm')void refreshQuote(next);
+   }
+ 
+@@ -614,10 +618,10 @@ function PosView({ uid, setUid, products, cart, setCart, onPay, disabled, busy,
+       // guest from hitting a dead "Preise abgelaufen" screen after taking a moment to confirm.
+       if(quote.expiresAt<=Date.now()){await refreshQuote(cart);setError('Preise aktualisiert. Bitte erneut bestätigen.');return;}
+       const usable=quote;
+-      if (wallet.balanceCents < usable.totalCents) { setError(`Es fehlen noch ${euro(usable.totalCents - wallet.balanceCents)}.`); feedback('error'); return }
+-      const result = await onPay(usable.quoteId,wallet);
++      if (!useFree && wallet.balanceCents < usable.totalCents) { setError(`Es fehlen noch ${euro(usable.totalCents - wallet.balanceCents)}.`); feedback('error'); return }
++      const result = await onPay(usable.quoteId,wallet,useFree?true:undefined);
+       feedback('success');
+-      setReceipt({ totalCents: result.totalCents, balanceCents: result.balanceCents });
++      setReceipt({ totalCents: result.totalCents, balanceCents: result.balanceCents,freeDrink:Boolean(result.freeDrink) });
+       setStage('success');
+       successTimer.current=window.setTimeout(reset, 1800);
+     } catch (reason) { setError((reason as Error).message); feedback('error') }
+@@ -627,7 +631,7 @@ function PosView({ uid, setUid, products, cart, setCart, onPay, disabled, busy,
+   if (stage === 'success') return (
+     <div className="flex min-h-[70dvh] flex-col items-center justify-center gap-3 text-center">
+       <div className="flex size-24 items-center justify-center rounded-full bg-success/15"><ShieldCheck className="size-14 text-success" /></div>
+-      <p className="text-3xl font-bold text-success">Erfolgreich abgebucht</p>
++      <p className="text-3xl font-bold text-success">{receipt?.freeDrink?'Freigetränk ausgegeben':'Erfolgreich abgebucht'}</p>
+       <p className="text-5xl font-bold tabular-nums">{euro(receipt?.totalCents ?? 0)}</p>
+       <p className="text-lg text-muted-foreground">Restguthaben <span className="font-bold text-foreground">{euro(receipt?.balanceCents ?? 0)}</span></p>
+     </div>
+@@ -636,7 +640,7 @@ function PosView({ uid, setUid, products, cart, setCart, onPay, disabled, busy,
+   if (stage === 'confirm' && wallet) return (
+     <div className="mx-auto flex w-full max-w-xl flex-col gap-4 pb-32">
+       <StepBar steps={['Armband', 'Bestellung', 'Bezahlung']} current={2} />
+-      <h2 className="text-center text-2xl font-bold">Deine Bestellung</h2>
++      <BoundBandBar wallet={wallet} onRelease={reset} disabled={charging||busy}/><h2 className="text-center text-2xl font-bold">Bestellung prüfen</h2>
+       <div className="flex flex-col divide-y divide-border rounded-xl border border-border bg-card">
+         {products.filter(product => cart[product.id]).map(product => {
+           const line = quote?.items.find(item => item.productId === product.id);
+@@ -652,6 +656,7 @@ function PosView({ uid, setUid, products, cart, setCart, onPay, disabled, busy,
+           );
+         })}
+       </div>
++      {wallet.freeDrinkStatus==='AVAILABLE'&&itemCount===1&&Boolean(quote&&quote.totalCents>0)&&<Button className="h-14" variant={useFree?'default':'outline'} disabled={charging||busy||disabled||quoting} onClick={()=>setFreeDrink(v=>!v)}>{useFree?'✓ Freigetränk wird eingelöst – abwählen':'🎁 Freigetränk einlösen (0 €)'}</Button>}
+       <div className="flex flex-col gap-2 rounded-xl border border-border bg-card p-4">
+         <div className="flex justify-between text-sm"><span className="text-muted-foreground">Aktuelles Guthaben</span><span className="tabular-nums">{euro(wallet.balanceCents)}</span></div>
+         <div className="flex justify-between text-sm"><span className="text-muted-foreground">Bestellung</span><span className="tabular-nums text-primary">−{euro(total)}</span></div>
+@@ -664,7 +669,7 @@ function PosView({ uid, setUid, products, cart, setCart, onPay, disabled, busy,
+       {error && <p className="text-center font-semibold text-destructive">{error}</p>}
+       <div className="fixed inset-x-0 bottom-[calc(3.6rem+env(safe-area-inset-bottom))] z-30 flex flex-col gap-2 border-t border-border bg-background/95 p-3 backdrop-blur sm:bottom-0">
+         <Button size="lg" className="h-14 w-full text-lg" disabled={disabled || !quote || missing > 0 || charging || busy || quoting} onClick={() => void pay()}>
+-          {charging ? <><Loader2 className="animate-spin" />Zahlung wird verarbeitet</> : missing > 0 ? 'Guthaben unzureichend' : `Jetzt bezahlen · ${euro(total)}`}
++          {charging ? <><Loader2 className="animate-spin" />Zahlung wird verarbeitet</> : missing > 0 ? 'Guthaben unzureichend' : useFree?'Freigetränk ausgeben · 0,00 €':`Jetzt bezahlen · ${euro(total)}`}
+         </Button>
+         <Button variant="ghost" size="sm" disabled={charging} onClick={() => setStage('order')}>Bestellung bearbeiten</Button>
+       </div>
+@@ -681,7 +686,8 @@ function PosView({ uid, setUid, products, cart, setCart, onPay, disabled, busy,
+ 
+   return <div className="flex flex-col gap-4 pb-28">
+     <StepBar steps={['Armband', 'Bestellung', 'Bezahlung']} current={1} />
+-    <BoundBandBar wallet={wallet} onRelease={reset} />
++    <BoundBandBar wallet={wallet} onRelease={reset} disabled={charging||busy} />
++    {wallet.freeDrinkStatus==='AVAILABLE'&&<p className="rounded-xl border border-success/40 bg-success/10 p-3 text-sm font-semibold text-success">1 Freigetränk verfügbar. Wähle ein einzelnes Getränk aus und aktiviere bei der Bestätigung „Freigetränk einlösen“. Weitere Getränke danach separat buchen.</p>}
+     {categories.map(category => (
+       <section key={category}>
+         <h2 className="mb-2 text-xs font-bold uppercase tracking-widest text-muted-foreground">{category}</h2>
+@@ -716,12 +722,12 @@ function TopupView({ uid, setUid, onTopup, disabled, busy, api, setView, nfc, te
+   const [confirmedBalance,setConfirmedBalance]=useState<number|null>(null);const bookingLock=useRef(false);const topupTimer=useRef<number|undefined>(undefined);useEffect(()=>()=>window.clearTimeout(topupTimer.current),[]);
+   const [cashOpen,setCashOpen]=useState<boolean|null>(null);
+   const [openingCash,setOpeningCash]=useState('0');const [openingBusy,setOpeningBusy]=useState(false);
+-  async function openCash(){if(openingBusy)return;const cents=toCents(openingCash);if(!Number.isInteger(cents)||cents<0||cents>100000){setError('Anfangsbestand muss zwischen 0 und 1000 € liegen.');return;}setOpeningBusy(true);try{await api.openCashSession(cents);setCashOpen(true);setError('');toast.success('Bargeldkasse eröffnet')}catch(e){setError((e as Error).message)}finally{setOpeningBusy(false)}}
++  async function openCash(){if(openingBusy)return;const cents=cashAmount(openingCash);if(!Number.isInteger(cents)||cents<0||cents>100000){setError('Anfangsbestand muss zwischen 0 und 1000 € liegen.');return;}setOpeningBusy(true);try{await api.openCashSession(cents);setCashOpen(true);setError('');toast.success('Bargeldkasse eröffnet')}catch(e){setError((e as Error).message)}finally{setOpeningBusy(false)}}
+   useEffect(()=>{let active=true;const refresh=()=>void api.cashSession().then(s=>{if(active)setCashOpen(Boolean(s))}).catch(()=>{if(active)setCashOpen(null)});refresh();const t=setInterval(refresh,5000);return()=>{active=false;clearInterval(t)}},[api]);
+   const [stage, setStage] = useState<'scan' | 'amount' | 'payment' | 'success'>('scan');
+   const [error, setError] = useState('');
+-  const selectedAmount = showCustom && custom ? toCents(custom) : amount ?? 0;
+-  const amountValid = Number.isFinite(selectedAmount) && selectedAmount >= 100 && selectedAmount <= 20000;
++  const selectedAmount = showCustom ? (cashAmount(custom)||0) : amount ?? 0;
++  const amountValid = Number.isSafeInteger(selectedAmount) && selectedAmount >= 100 && selectedAmount <= 20000;
+   const cashBlocked = method==='CASH' && cashOpen!==true;
+ 
+   function reset() { bookingLock.current=false;scanLocked.current=false; setUid(''); setWallet(null); setAmount(null); setCustom(''); setShowCustom(false); setConfirmedBalance(null); setMethod('CASH'); setStage('scan'); setError('') }
+@@ -763,6 +769,7 @@ function TopupView({ uid, setUid, onTopup, disabled, busy, api, setView, nfc, te
+   if (stage === 'payment') return (
+     <div className="mx-auto flex w-full max-w-xl flex-col gap-5 pb-32">
+       <StepBar steps={['Armband', 'Betrag', 'Zahlung']} current={2} />
++      <BoundBandBar wallet={wallet} onRelease={reset} disabled={busy||bookingLock.current} />
+       <div className="flex flex-col items-center gap-3 rounded-xl border border-border bg-card p-6 text-center">
+         {method === 'CASH' ? <Landmark className="size-14 text-primary" /> : <CreditCard className="size-14 text-primary" />}
+         <p className="text-5xl font-bold tabular-nums">{euro(selectedAmount)}</p>
+@@ -770,7 +777,7 @@ function TopupView({ uid, setUid, onTopup, disabled, busy, api, setView, nfc, te
+         <p className="text-sm text-muted-foreground">{method === 'CASH' ? 'Bestätige erst, wenn das Bargeld vollständig vorliegt.' : 'Bestätige erst, wenn die Zahlung in PayPal sichtbar eingegangen ist.'}</p>
+       </div>
+       {method === 'CARD_VERIFIED' && <p className="text-sm text-muted-foreground">Manuell bestätigt – keine automatische PayPal-Verifizierung. Zahlungseingang und Betrag vor Buchung im Empfängerkonto prüfen.</p>}
+-      {cashBlocked && <p className="text-sm text-destructive">Bargeldkasse nicht geöffnet oder Status unbekannt. Unter Betrieb → Kasse eröffnen.</p>}
++      {cashBlocked && <p className="text-sm text-destructive">Bargeldkasse nicht geöffnet oder Status unbekannt. Gehe zurück zur Betragsauswahl und eröffne dort die Kasse.</p>}
+       <div className="flex justify-between rounded-xl border border-border bg-card p-4 text-sm">
+         <span className="text-muted-foreground">Guthaben danach</span>
+         <span className="text-xl font-bold tabular-nums text-success">{euro(wallet.balanceCents + selectedAmount)}</span>
+@@ -787,7 +794,7 @@ function TopupView({ uid, setUid, onTopup, disabled, busy, api, setView, nfc, te
+ 
+   return <div className="mx-auto flex w-full max-w-xl flex-col gap-5 pb-32">
+     <StepBar steps={['Armband', 'Betrag', 'Zahlung']} current={1} />
+-    <BoundBandBar wallet={wallet} onRelease={reset} />
++    <BoundBandBar wallet={wallet} onRelease={reset} disabled={busy||bookingLock.current} />
+     <h2 className="text-xl font-bold">Wie viel möchtest du aufladen?</h2>
+     <div className="grid grid-cols-3 gap-2">
+       {TOPUP_AMOUNTS.map(value => (
+@@ -801,7 +808,7 @@ function TopupView({ uid, setUid, onTopup, disabled, busy, api, setView, nfc, te
+       <Button size="lg" className="h-14" variant={method === 'CASH' ? 'default' : 'outline'} onClick={() => setMethod('CASH')}><Landmark />Bargeld</Button>
+       <Button size="lg" className="h-14" variant={method === 'CARD_VERIFIED' ? 'default' : 'outline'} onClick={() => setMethod('CARD_VERIFIED')}><CreditCard />PayPal</Button>
+     </div>
+-    {cashBlocked && <Card><CardContent className="flex flex-col gap-2 pt-4"><p className="text-sm font-semibold">Bargeldkasse dieses Terminals ist nicht geöffnet.</p><Label>Anfangsbestand in Euro</Label><Input value={openingCash} inputMode="decimal" onChange={e=>setOpeningCash(e.target.value)}/><Button disabled={openingBusy} onClick={()=>void openCash()}>Kasse eröffnen</Button></CardContent></Card>}
++    {cashBlocked && <Card><CardContent className="flex flex-col gap-2 pt-4"><p className="text-sm font-semibold">{cashOpen===null?'Kassenstatus wird geprüft …':'Bargeldkasse dieses Terminals ist nicht geöffnet.'}</p><Label>Anfangsbestand in Euro</Label><Input value={openingCash} inputMode="decimal" onChange={e=>setOpeningCash(e.target.value)}/><Button disabled={openingBusy||cashOpen===null||disabled||!Number.isSafeInteger(cashAmount(openingCash))||cashAmount(openingCash)<0||cashAmount(openingCash)>100000} onClick={()=>void openCash()}>Kasse eröffnen</Button></CardContent></Card>}
+     {error&&<p className="text-destructive text-sm">{error}</p>}
+     {amountValid && <div className="flex justify-between rounded-xl border border-border bg-card p-4 text-sm"><span className="text-muted-foreground">Guthaben danach</span><span className="text-xl font-bold tabular-nums text-success">{euro(wallet.balanceCents + selectedAmount)}</span></div>}
+     <div className="fixed inset-x-0 bottom-[calc(3.6rem+env(safe-area-inset-bottom))] z-30 border-t border-border bg-background/95 p-3 backdrop-blur sm:bottom-0">
+@@ -816,7 +823,7 @@ function HistoryRow({ entry, canRefund, onRefund }: { entry: HistoryEntry; canRe
+   const positive = entry.amountCents > 0;
+   return <div className="flex items-center justify-between gap-3 border-b border-border py-3">
+     <div className="min-w-0">
+-      <p className="font-bold">{HISTORY_LABEL[entry.type]}{entry.type === 'TOPUP' && ` · ${METHOD_LABEL[entry.fundingMethod] ?? entry.fundingMethod}`}</p>
++      <p className="font-bold">{entry.type==='PURCHASE'&&entry.freeDrink?'Freigetränk':HISTORY_LABEL[entry.type]}{entry.type === 'TOPUP' && ` · ${METHOD_LABEL[entry.fundingMethod] ?? entry.fundingMethod}`}</p>
+       <p className="truncate text-xs text-muted-foreground">{time}{entry.type === 'REFUND' && ` · ${entry.reason}`}{entry.type === 'PURCHASE' && entry.status !== 'PAID' && ` · ${entry.status}`}</p>
+     </div>
+     <div className="flex shrink-0 items-center gap-3">
+@@ -834,6 +841,7 @@ function CustomerView({ uid, setUid, api, setView, nfc, scanLocked }: { scanLock
+   const [wallet, setWallet] = useState<WalletIdentity | null>(null);
+   const [entries, setEntries] = useState<HistoryEntry[]>([]);const [truncated,setTruncated]=useState(false);const lookupGeneration=useRef(0);useEffect(()=>()=>{lookupGeneration.current++;scanLocked.current=false},[scanLocked]);
+   const [loading, setLoading] = useState(false);
++  const actionLock=useRef(false);const [actionBusy,setActionBusy]=useState(false);const [lookupError,setLookupError]=useState('');
+   const [refundTarget, setRefundTarget] = useState<(HistoryEntry & { type: 'PURCHASE' }) | null>(null);
+   const [refundAmount, setRefundAmount] = useState('');
+   const [refundReason, setRefundReason] = useState('Fehlbuchung bestätigt');
+@@ -846,37 +854,33 @@ function CustomerView({ uid, setUid, api, setView, nfc, scanLocked }: { scanLock
+   const canAct = roles.includes('PAYMENT_LEAD') || roles.includes('ADMIN');
+ 
+   async function load(identifier: string) {
+-    const generation=++lookupGeneration.current;setLoading(true);
++    const generation=++lookupGeneration.current;setLoading(true);setLookupError('');
+     try { const r=await api.walletHistory(identifier);if(generation!==lookupGeneration.current)return;scanLocked.current=true;setWallet(r.wallet);setEntries(r.entries);setTruncated(Boolean(r.truncated)) }
+-    catch {if(generation===lookupGeneration.current){scanLocked.current=false;setWallet(null);setEntries([])}}
++    catch(e) {if(generation===lookupGeneration.current){scanLocked.current=false;setWallet(null);setEntries([]);setLookupError((e as Error).message)}}
+     finally {if(generation===lookupGeneration.current)setLoading(false)}
+   }
+-  useEffect(() => {
+-    const trimmed = uid.trim();
+-    if (trimmed.length < 4) {lookupGeneration.current++;scanLocked.current=false;setWallet(null);setEntries([]);setLoading(false);return }
+-    const t = setTimeout(() => void load(trimmed), 300);
+-    return () => clearTimeout(t);
+-  }, [uid]);
++
+ 
+   async function act(fn: () => Promise<any>, message: string) {
+-    try { await fn(); toast.success(message); await load(wallet?.uidHex??wallet?.bandNumber??uid.trim()) } catch (e) { toast.error((e as Error).message) }
++    if(actionLock.current)return;actionLock.current=true;setActionBusy(true);const identifier=wallet?.uidHex??wallet?.bandNumber??uid.trim();try { await fn(); toast.success(message); await load(identifier) } catch (e) { toast.error((e as Error).message) }finally{actionLock.current=false;setActionBusy(false)}
+   }
+ 
+   // Unlike Kasse/Aufladung the service view must also find blocked bands — that is exactly when
+   // someone walks up with a problem — so it resolves through the history endpoint, not lookup.
+   if (!wallet) return (
+     <div className="mx-auto flex w-full max-w-xl flex-col gap-4">
+-      <NfcScanField uid={uid} setUid={setUid} api={api} nfc={nfc} onResolved={() => {}} title="Armband anhalten" hint="Armband scannen oder Tyvek-Nummer eingeben, um Guthaben und Verlauf zu prüfen." />
+-      {loading && <p className="text-center text-sm text-muted-foreground">Verlauf wird geladen …</p>}
++      <NfcScanField uid={uid} setUid={setUid} api={api} nfc={nfc} historyMode onHistory={result=>{if(!scanLocked.current){scanLocked.current=true;setWallet(result.wallet);setEntries(result.entries);setTruncated(Boolean(result.truncated));setLookupError('')}}} onResolved={()=>{}} title="Armband anhalten" hint="Armband scannen oder Tyvek-Nummer eingeben, um Guthaben und Verlauf zu prüfen." />
++      {loading && <p className="text-center text-sm text-muted-foreground">Verlauf wird geladen …</p>}{lookupError&&<p className="text-center text-destructive">{lookupError}</p>}
+       <TransactionSwitcher view="customer" setView={setView} />
+     </div>
+   );
+ 
+   return <div className="mx-auto flex w-full max-w-2xl flex-col gap-5 pb-24">
+-    <Button variant="ghost" size="sm" className="w-fit" onClick={() => { lookupGeneration.current++;scanLocked.current=false;setUid('');setWallet(null);setEntries([]);setRefundTarget(null);setShowBlock(false);setShowReplace(false) }}>Anderes Armband scannen</Button>
++    <BoundBandBar wallet={wallet} disabled={actionBusy} onRelease={() => { lookupGeneration.current++;scanLocked.current=false;setUid('');setWallet(null);setEntries([]);setRefundTarget(null);setShowBlock(false);setShowReplace(false);setNewBand('');setLookupError('') }} />
+     {loading && <p className="text-sm text-muted-foreground">Lädt…</p>}
+     {wallet && <>
+-      <WalletStrip wallet={wallet} />
++      <p className="text-sm text-muted-foreground">Status: {wallet.status==='ACTIVE'?'Aktiv':wallet.status==='FROZEN'?'Gesperrt':wallet.status}</p>
++      {canAct&&wallet.status==='ACTIVE'&&wallet.freeDrinkStatus==='NONE'&&<Button variant="outline" className="h-14" disabled={actionBusy||loading} onClick={()=>{if(window.confirm(`Ein Freigetränk für Armband ${wallet.bandNumber} freigeben?`))void act(()=>api.grantFreeDrink(wallet.uidHex??wallet.bandNumber,wallet.walletId),'Freigetränk freigegeben')}}>🎁 Ein Freigetränk freigeben</Button>}
+       <TransactionSwitcher view="customer" setView={setView} />
+       {canAct && (
+         <div className="grid grid-cols-2 gap-2">
+@@ -889,13 +893,13 @@ function CustomerView({ uid, setUid, api, setView, nfc, scanLocked }: { scanLock
+           <p className="text-sm text-muted-foreground">Neues Armband (NFC-UID oder Tyvek-Nr.) scannen oder eingeben, Guthaben von <span className="font-bold">{wallet.bandNumber}</span> wird übernommen.</p>
+           <Input value={newBand} onChange={e => setNewBand(e.target.value)} placeholder="Neue UID oder Band-Nr." className="h-12 font-mono" autoCapitalize="characters" />
+           <ReasonPicker label="Wechselgrund" value={replaceReason} onChange={setReplaceReason} presets={['Armband verloren', 'Armband defekt', 'Akku/Chip beschädigt', 'Falsch zugewiesen']} />
+-          <Button disabled={!newBand.trim()} onClick={() => void act(() => api.requestBandReplacement(wallet?.uidHex??wallet?.bandNumber??uid.trim(), newBand.trim(), replaceReason), 'Armbandwechsel beantragt – Freigabe durch zweite Person nötig')}>Wechsel beantragen</Button>
++          <Button disabled={actionBusy||!newBand.trim()} onClick={() => void act(() => api.requestBandReplacement(wallet?.uidHex??wallet?.bandNumber??uid.trim(), newBand.trim(), replaceReason), 'Armbandwechsel beantragt – Freigabe durch zweite Person nötig')}>Wechsel beantragen</Button>
+         </CardContent></Card>
+       )}
+       {canAct && showBlock && (
+         <Card><CardContent className="flex flex-col gap-3 pt-4">
+           <ReasonPicker label="Sperrgrund" value={blockReason} onChange={setBlockReason} presets={['Armband verloren', 'Verdacht auf Missbrauch', 'Kunde bittet um Sperrung']} />
+-          <Button variant="destructive" onClick={() => void act(() => api.blockWristband(wallet.uidHex??wallet.bandNumber,blockReason), 'Armband gesperrt').then(() => setShowBlock(false))}>Jetzt sperren</Button>
++          <Button variant="destructive" disabled={actionBusy} onClick={() => void act(() => api.blockWristband(wallet.uidHex??wallet.bandNumber,blockReason), 'Armband gesperrt').then(() => setShowBlock(false))}>Jetzt sperren</Button>
+         </CardContent></Card>
+       )}
+       <section className="border-t border-border pt-3">
+@@ -913,7 +917,7 @@ function CustomerView({ uid, setUid, api, setView, nfc, scanLocked }: { scanLock
+           <ReasonPicker label="Stornogrund" value={refundReason} onChange={setRefundReason} presets={['Fehlbuchung bestätigt', 'Falsches Getränk kassiert', 'Kunde storniert', 'Doppelte Buchung']} />
+         </div>
+         <DialogFooter>
+-          <Button onClick={() => { if (!refundTarget) return; void act(() => api.requestRefund(refundTarget.id, refundReason, refundAmount ? toCents(refundAmount) : undefined), 'Storno beantragt – Freigabe durch zweite Person nötig').then(() => setRefundTarget(null)) }}>Storno beantragen</Button>
++          <Button disabled={actionBusy} onClick={() => { if (!refundTarget) return; void act(() => api.requestRefund(refundTarget.id, refundReason, refundAmount ? toCents(refundAmount) : undefined), 'Storno beantragt – Freigabe durch zweite Person nötig').then(() => setRefundTarget(null)) }}>Storno beantragen</Button>
+         </DialogFooter>
+       </DialogContent>
+     </Dialog>
+@@ -1103,13 +1107,14 @@ function EventPanel({ api }: { api: Api }) {
+   const [state, setState] = useState<EventState | null>(null);
+   const [name, setName] = useState('Börsenparty');
+   const [busy, setBusy] = useState(false);
+-  const [confirm, setConfirm] = useState<'begin-closing' | 'close' | null>(null);
+-  const refresh = () => api.eventState().then(setState).catch(e => toast.error(e.message));
+-  useEffect(() => { void refresh(); const timer = setInterval(refresh, 10000); return () => clearInterval(timer) }, [api]);
++  const [confirm, setConfirm] = useState<'begin-closing' | 'close' | 'back' | null>(null);
++  const eventSequence=useRef(0);
++  const refresh = async () => {const n=++eventSequence.current;try{const next=await api.eventState();if(n===eventSequence.current)setState(next)}catch(e){if(n===eventSequence.current)toast.error((e as Error).message)}};
++  useEffect(() => { void refresh(); const timer = setInterval(refresh, 10000); return () => {clearInterval(timer);eventSequence.current++} }, [api]);
+ 
+   async function act(fn: () => Promise<EventState>, message: string) {
+     setBusy(true);
+-    try { await fn(); await refresh(); toast.success(message) }
++    try { const next=await fn();eventSequence.current++;setState(next);toast.success(message);await refresh() }
+     catch (e) { toast.error((e as Error).message) }
+     finally { setBusy(false); setConfirm(null) }
+   }
+@@ -1135,7 +1140,7 @@ function EventPanel({ api }: { api: Api }) {
+         </CardHeader>
+       </Card>
+ 
+-      {(state.phase === 'PREPARING' || state.phase === 'CLOSED') && (
++      {state.phase === 'PREPARING' && (
+         <Card>
+           <CardHeader>
+             <CardTitle>Bereit für die Börsenparty?</CardTitle>
+@@ -1161,6 +1166,10 @@ function EventPanel({ api }: { api: Api }) {
+         </Card>
+       )}
+ 
++      <div className="grid grid-cols-4 gap-1 text-center text-xs font-semibold" aria-label="Veranstaltungsablauf">{(['PREPARING','OPEN','CLOSING','CLOSED'] as const).map((phase,i)=><div key={phase} className={`rounded-lg border p-2 ${state.phase===phase?'border-primary bg-primary/10 text-primary':'text-muted-foreground'}`}>{i+1}. {['Vorbereitung','Verkauf','Abschluss','Fertig'][i]}</div>)}</div>
++      {state.phase !== 'PREPARING' && <Button variant="outline" size="lg" disabled={busy} onClick={()=>setConfirm('back')}>{state.phase==='CLOSING'?'← Verkauf wieder aufnehmen':state.phase==='CLOSED'?'← Abschluss erneut öffnen':'← Zur Vorbereitung (nur ohne Buchungen)'}</Button>}
++      {state.phase==='CLOSED'&&<p className="rounded-lg border p-4 text-sm text-muted-foreground">Veranstaltung abgeschlossen. Berichte, Kassenzählungen und Guthaben bleiben erhalten. Für eine neue Veranstaltung eine separate Datenbank verwenden.</p>}
++      {state.phase==='OPEN'&&state.mode==='PAYMENT_STOP'&&<p className="rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-sm font-semibold text-destructive">Verkauf bleibt gesperrt. Freigabe über Betrieb → Freigaben erforderlich.</p>}
+       {state.phase === 'OPEN' && (
+         <Card>
+           <CardHeader><CardTitle>Veranstaltung beenden</CardTitle><CardDescription>Schritt 1 stoppt Verkauf und Aufladung. Guthaben, Verlauf und Berichte bleiben unverändert erhalten.</CardDescription></CardHeader>
+@@ -1180,7 +1189,7 @@ function EventPanel({ api }: { api: Api }) {
+               <div><p className="text-xs text-muted-foreground">Offene Anträge</p><p className="text-xl font-bold">{state.closing.pendingApprovals}</p></div>
+               <div><p className="text-xs text-muted-foreground">Restguthaben</p><p className="text-xl font-bold tabular-nums">{euro(state.closing.outstandingCents)}</p><p className="text-xs text-muted-foreground">auf {state.closing.outstandingWallets} Armbändern</p></div>
+             </div>
+-            {state.closing.openCashSessions.length > 0 && <p className="rounded-lg border border-destructive bg-destructive/10 p-3 text-sm font-semibold text-destructive">Zuerst alle Kassen unter „Kasse" zählen und schließen.</p>}
++            {state.closing.openCashSessions.length > 0 && <div className="flex flex-col gap-2"><p className="font-semibold">Noch offen: {state.closing.openCashSessions.map(s=>s.terminalName).join(', ')}</p><CashPanel api={api} closingOnly onChanged={refresh}/></div>}
+             <Button variant="destructive" size="lg" disabled={busy || state.closing.openCashSessions.length > 0 || state.closing.pendingOperations > 0 || state.closing.pendingApprovals > 0} onClick={() => setConfirm('close')}>Veranstaltung endgültig abschließen</Button>
+           </CardContent>
+         </Card>
+@@ -1189,19 +1198,19 @@ function EventPanel({ api }: { api: Api }) {
+       <AlertDialog open={Boolean(confirm)} onOpenChange={open => { if (!open) setConfirm(null) }}>
+         <AlertDialogContent>
+           <AlertDialogHeader>
+-            <AlertDialogTitle>{confirm === 'begin-closing' ? 'Verkaufsende einleiten?' : 'Veranstaltung abschließen?'}</AlertDialogTitle>
++            <AlertDialogTitle>{confirm==='back'?'Vorherigen Schritt wieder öffnen?':confirm === 'begin-closing' ? 'Verkaufsende einleiten?' : 'Veranstaltung abschließen?'}</AlertDialogTitle>
+             <AlertDialogDescription>
+-              {confirm === 'begin-closing'
+-                ? 'An allen Kassen können ab sofort keine Getränke mehr verkauft und keine Guthaben mehr aufgeladen werden. Bereits begonnene Zahlungen laufen zu Ende.'
++              {confirm==='back'?(state.phase==='CLOSING'?'Der vorherige Betriebsmodus wird wiederhergestellt; eine vorherige Zahlungssperre bleibt aktiv. Bereits gezählte Kassen bleiben geschlossen und müssen bei Bedarf neu eröffnet werden.':'Buchungen, Guthaben, Berichte und Kassenzählungen bleiben erhalten. Der Status wird im Audit protokolliert.'):confirm === 'begin-closing'
++                ? 'An allen Kassen können ab sofort keine Getränke mehr verkauft und keine Guthaben mehr aufgeladen werden. Bereits bestätigte Buchungen bleiben erhalten. Ungeklärte Vorgänge müssen geprüft werden.'
+                 : 'Die Veranstaltung wird als abgeschlossen vermerkt. Alle Transaktionen und Guthaben bleiben nachvollziehbar erhalten; eine erneute Eröffnung ist nur durch die Veranstaltungsleitung möglich.'}
+             </AlertDialogDescription>
+           </AlertDialogHeader>
+           <AlertDialogFooter>
+             <AlertDialogCancel>Abbrechen</AlertDialogCancel>
+-            <AlertDialogAction onClick={() => confirm === 'begin-closing'
++            <AlertDialogAction onClick={() => confirm==='back'?void act(()=>api.backEvent(state.phase),'Vorheriger Schritt geöffnet'):confirm === 'begin-closing'
+               ? void act(() => api.beginEventClosing(), 'Verkauf gestoppt')
+               : void act(() => api.closeEvent(), 'Veranstaltung abgeschlossen')}>
+-              {confirm === 'begin-closing' ? 'Verkauf stoppen' : 'Abschließen'}
++              {confirm==='back'?'Schritt zurück':confirm === 'begin-closing' ? 'Verkauf stoppen' : 'Abschließen'}
+             </AlertDialogAction>
+           </AlertDialogFooter>
+         </AlertDialogContent>
+@@ -1251,6 +1260,7 @@ function ReportPanel({ api, health }: { api: Api; health: any }) {
+             <CardHeader><CardTitle className="text-base">Aufladungen nach Zahlart</CardTitle></CardHeader>
+             <CardContent className="flex flex-col gap-2">
+               {report.integrityIssues?.length>0&&<p className="text-sm text-destructive">Buchhaltung inkonsistent: {report.integrityIssues.join(', ')}</p>}
++              {report.freeDrinks&&<p className="text-sm text-muted-foreground">Freigetränke: {report.freeDrinks.redeemed} von {report.freeDrinks.granted} eingelöst · Warenwert {euro(report.freeDrinks.faceValueCents)}</p>}
+               {report.startingCredit&&<p className="text-sm text-muted-foreground">Startguthaben (netto): {euro(report.startingCredit.netCents)}</p>}
+               {(report.topupsByMethod as any[]).length === 0 && <p className="text-sm text-muted-foreground">Noch keine Aufladungen.</p>}
+               {(report.topupsByMethod as any[]).map(m => (
+@@ -1433,6 +1443,7 @@ const WRISTBAND_PAGE_SIZE = 25;
+ function WristbandPanel({ api }: { api: Api }) {
+   const [bandNumber, setBandNumber] = useState(''); const [uid, setUid] = useState('');
+   const [kind, setKind] = useState<'NFC' | 'TYVEK'>('NFC');
++  const [grantDrink,setGrantDrink]=useState(false),[registering,setRegistering]=useState(false);const registrationLock=useRef(false);const canGrant=api.roles().some(r=>r==='ADMIN'||r==='PAYMENT_LEAD');
+   const [search, setSearch] = useState('');
+   const [statusFilter, setStatusFilter] = useState<'ALL' | Wristband['status']>('ALL');
+   const [page, setPage] = useState(0);
+@@ -1445,11 +1456,12 @@ function WristbandPanel({ api }: { api: Api }) {
+   useEffect(() => { void refresh() }, [api]);
+ 
+   async function register() {
++    if(registrationLock.current)return;registrationLock.current=true;setRegistering(true);
+     try {
+-      await api.registerWristband({ bandNumber, kind, uid: kind === 'NFC' ? uid : undefined, initialBalanceCents: STARTING_BALANCE_CENTS });
++      await api.registerWristband({ bandNumber, kind, uid: kind === 'NFC' ? uid : undefined, initialBalanceCents: STARTING_BALANCE_CENTS,freeDrink:canGrant&&grantDrink });
+       toast.success(`${kind === 'TYVEK' ? 'Tyvek-Armband' : 'NFC-Armband'} ${bandNumber} mit ${euro(STARTING_BALANCE_CENTS)} Startguthaben registriert`);
+-      setBandNumber(''); setUid(''); await refresh();
+-    } catch (e) { toast.error((e as Error).message) }
++      setBandNumber(''); setUid('');setGrantDrink(false); await refresh();
++    } catch (e) { toast.error((e as Error).message) }finally{registrationLock.current=false;setRegistering(false)}
+   }
+ 
+   async function importFile(file: File) {
+@@ -1491,7 +1503,8 @@ function WristbandPanel({ api }: { api: Api }) {
+           {kind === 'NFC'
+             ? <UidScanner uid={uid} setUid={setUid} api={api} hideNotFoundHint />
+             : <div className="rounded-lg border border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground">Tyvek benötigt keinen Chip. Bezahlt wird später durch Eingabe oder Scan der aufgedruckten Nummer.</div>}
+-          <Button size="lg" disabled={!bandNumber.trim() || (kind === 'NFC' && !uid)} onClick={register}>{kind === 'TYVEK' ? 'Tyvek-Armband anlegen' : 'NFC-Armband registrieren'}</Button>
++          {canGrant&&<label className="flex items-center gap-3 rounded-xl border p-3 text-sm font-semibold"><input type="checkbox" className="size-6" checked={grantDrink} disabled={registering} onChange={e=>setGrantDrink(e.target.checked)}/>Ein Freigetränk zusätzlich freigeben</label>}
++          <Button size="lg" disabled={registering||!bandNumber.trim() || (kind === 'NFC' && !uid)} onClick={register}>{kind === 'TYVEK' ? 'Tyvek-Armband anlegen' : 'NFC-Armband registrieren'}</Button>
+         </CardContent>
+       </Card>
+ 
+@@ -1535,7 +1548,7 @@ function WristbandPanel({ api }: { api: Api }) {
+             <TableBody>
+               {loading && Array.from({ length: 4 }).map((_, i) => <TableRow key={i}>{Array.from({ length: 6 }).map((__, c) => <TableCell key={c}><Skeleton className="h-5 w-full" /></TableCell>)}</TableRow>)}
+               {!loading && visibleWristbands.map(band => <TableRow key={band.id}>
+-                <TableCell><p className="font-bold">{band.bandNumber}</p><p className="text-xs text-muted-foreground">angelegt {new Date(band.createdAt).toLocaleDateString('de-DE')}</p></TableCell>
++                <TableCell><p className="font-bold">{band.bandNumber}</p>{band.freeDrinkStatus==='AVAILABLE'&&<p className="text-xs font-semibold text-success">Freigetränk offen</p>}{band.freeDrinkStatus==='REDEEMED'&&<p className="text-xs text-muted-foreground">Freigetränk eingelöst</p>}<p className="text-xs text-muted-foreground">angelegt {new Date(band.createdAt).toLocaleDateString('de-DE')}</p></TableCell>
+                 <TableCell><Badge variant="outline">{band.kind === 'TYVEK' ? 'Tyvek' : 'NFC'}</Badge></TableCell>
+                 <TableCell className="max-w-40 truncate font-mono text-xs">{band.uidHex ?? '– ohne Chip –'}</TableCell>
+                 <TableCell><Badge variant={band.status === 'ACTIVE' ? 'success' : band.status === 'BLOCKED' ? 'destructive' : 'secondary'}>{band.status}</Badge></TableCell>
+@@ -1558,34 +1571,23 @@ function WristbandPanel({ api }: { api: Api }) {
+   );
+ }
+ 
+-function CashPanel({ api }: { api: Api }) {
+-  const [session, setSession] = useState<any>(null);
+-  const [opening, setOpening] = useState('0'); const [counted, setCounted] = useState(''); const [reason, setReason] = useState('');
+-  useEffect(() => { void api.cashSession().then(setSession).catch(e => toast.error(e.message)) }, [api]);
+-  return (
+-    <Card>
+-      <CardHeader><CardTitle className="flex items-center gap-2"><Landmark className="h-4 w-4" />Kassensitzung</CardTitle></CardHeader>
+-      <CardContent>
+-        {session ? (
+-          <>
+-            <div className="grid grid-cols-3 gap-2 text-sm">
+-              <div><p className="text-muted-foreground">Eröffnung</p><p className="font-bold">{euro(session.openingCashCents)}</p></div>
+-              <div><p className="text-muted-foreground">Bar-Aufladungen</p><p className="font-bold">{euro(session.movementsCents)}</p></div>
+-              <div><p className="text-muted-foreground">Soll</p><p className="font-bold text-primary">{euro(session.expectedCashCents)}</p></div>
+-            </div>
+-            <div className="flex flex-col gap-1.5"><Label>Gezählter Bestand (€)</Label><Input inputMode="decimal" value={counted} onChange={e => setCounted(e.target.value)} /></div>
+-            <div className="flex flex-col gap-1.5"><Label>Begründung bei Differenz</Label><Input value={reason} onChange={e => setReason(e.target.value)} /></div>
+-            <Button onClick={async () => { try { const r = await api.closeCashSession(toCents(counted), reason || undefined); toast.success(`Kasse geschlossen · Differenz ${euro(r.differenceCents)}`); setSession(null) } catch (e) { toast.error((e as Error).message) } }}>Kasse zählen und schließen</Button>
+-          </>
+-        ) : (
+-          <>
+-            <div className="flex flex-col gap-1.5"><Label>Startbestand (€)</Label><Input inputMode="decimal" value={opening} onChange={e => setOpening(e.target.value)} /></div>
+-            <Button onClick={async () => { try { setSession(await api.openCashSession(toCents(opening))); toast.success('Kasse geöffnet') } catch (e) { toast.error((e as Error).message) } }}>Kasse öffnen</Button>
+-          </>
+-        )}
+-      </CardContent>
+-    </Card>
+-  );
++function cashAmount(value:string){return /^\d+(?:[.,]\d{1,2})?$/.test(value.trim())?toCents(value):NaN}
++function CashCloseCard({api,session,onChanged,readOnly}:{api:Api;session:OpenCashSession;onChanged:()=>Promise<void>;readOnly:boolean}){
++  const [counted,setCounted]=useState('');const [reason,setReason]=useState('');const [busy,setBusy]=useState(false);const guard=useRef(false);
++  const amount=cashAmount(counted), valid=Number.isSafeInteger(amount)&&amount>=0&&amount<=1000000;
++  const difference=amount-session.expectedCashCents;
++  async function close(){if(guard.current||!valid||readOnly||(difference!==0&&reason.trim().length<5))return;guard.current=true;setBusy(true);try{const r=await api.closeCashSession(session.id,session.expectedCashCents,amount,reason.trim()||undefined);toast.success(`${session.terminalName}: geschlossen · Differenz ${euro(r.differenceCents)}`);setCounted('');setReason('');await onChanged()}catch(e){toast.error((e as Error).message);await onChanged()}finally{guard.current=false;setBusy(false)}}
++  return <Card><CardHeader><CardTitle>{session.terminalName}</CardTitle><CardDescription>{session.operatorName} · seit {new Date(session.openedAt).toLocaleTimeString('de-DE',{hour:'2-digit',minute:'2-digit'})}</CardDescription></CardHeader><CardContent><div className="grid grid-cols-3 gap-2 text-sm"><div>Start<p className="font-bold">{euro(session.openingCashCents)}</p></div><div>Bewegungen<p className="font-bold">{euro(session.movementsCents)}</p></div><div>Soll<p className="font-bold text-primary">{euro(session.expectedCashCents)}</p></div></div>{!readOnly&&<><Label>Gezähltes Bargeld (€)</Label><Input aria-label={`Gezähltes Bargeld ${session.terminalName}`} inputMode="decimal" placeholder="Tatsächlichen Bestand eingeben" value={counted} disabled={busy} onChange={e=>setCounted(e.target.value)}/>{valid&&difference!==0&&<><p className="text-sm text-destructive">Differenz: {euro(difference)}</p><Label>Grund für die Differenz</Label><Input aria-label="Grund für die Differenz" value={reason} maxLength={500} disabled={busy} onChange={e=>setReason(e.target.value)}/></>}<Button disabled={busy||!valid||(difference!==0&&reason.trim().length<5)} onClick={()=>void close()}>{busy?'Wird geschlossen…':'Kasse schließen'}</Button></>}</CardContent></Card>
++}
++function CashPanel({api,closingOnly=false,onChanged}:{api:Api;closingOnly?:boolean;onChanged?:()=>Promise<void>}){
++  const roles=api.roles(),lead=roles.some(r=>r==='ADMIN'||r==='PAYMENT_LEAD'),all=lead||roles.includes('AUDITOR'),canOpen=lead||roles.includes('TOPUP');
++  const [sessions,setSessions]=useState<OpenCashSession[]|null>(null);const [phase,setPhase]=useState<EventPhase|null>(null);const [opening,setOpening]=useState('0');const [busy,setBusy]=useState(false);const guard=useRef(false);const sequence=useRef(0);const [error,setError]=useState('');
++  async function refresh(){const n=++sequence.current;try{const [rows,event]=await Promise.all([all?api.cashSessions():api.cashSession().then(x=>x?[x]:[]),api.eventState()]);if(n===sequence.current){setSessions(rows);setPhase(event.phase);setError('')}}catch(e){if(n===sequence.current)setError((e as Error).message)}}
++  useEffect(()=>{void refresh();const timer=setInterval(refresh,5000);return()=>{clearInterval(timer);sequence.current++}},[api,all]);
++  async function changed(){await refresh();await onChanged?.()}
++  const own=sessions?.some(s=>s.terminalId===api.terminalId());const cents=cashAmount(opening);
++  async function open(){if(guard.current||!canOpen||!Number.isSafeInteger(cents)||cents<0||cents>100000)return;guard.current=true;setBusy(true);try{await api.openCashSession(cents);toast.success('Kasse geöffnet');await changed()}catch(e){toast.error((e as Error).message);await refresh()}finally{guard.current=false;setBusy(false)}}
++  return <div className="flex flex-col gap-3">{error&&<p role="alert" className="text-sm text-destructive">{error} <Button variant="outline" size="sm" onClick={()=>void refresh()}>Neu laden</Button></p>}{sessions===null?<Skeleton className="h-24 w-full"/>:sessions.length===0?<p className="rounded-lg border p-3 text-sm font-semibold">Keine offene Kasse.</p>:sessions.map(s=><CashCloseCard key={`${s.id}:${s.expectedCashCents}`} api={api} session={s} onChanged={changed} readOnly={!lead&&!(roles.includes('TOPUP')&&s.terminalId===api.terminalId())}/>)}{!closingOnly&&!own&&sessions!==null&&canOpen&&(phase==='PREPARING'||phase==='OPEN')&&<Card><CardHeader><CardTitle>Eigene Kasse eröffnen</CardTitle><CardDescription>Nur falls an diesem Terminal Bargeld angenommen wird.</CardDescription></CardHeader><CardContent><Label>Startbestand (€)</Label><Input inputMode="decimal" value={opening} disabled={busy} onChange={e=>setOpening(e.target.value)}/><Button disabled={busy||!Number.isSafeInteger(cents)||cents<0||cents>100000} onClick={()=>void open()}>Kasse eröffnen</Button></CardContent></Card>}</div>
+ }
+ 
+ // Mirrors CRASH_DEFAULT_MINUTES on the API, which the physical crash button uses.
+diff --git a/apps/web/src/terminal/feedback.ts b/apps/web/src/terminal/feedback.ts
+index 7599ab8..9532d38 100644
+--- a/apps/web/src/terminal/feedback.ts
++++ b/apps/web/src/terminal/feedback.ts
+@@ -13,13 +13,8 @@ const euroFormat = new Intl.NumberFormat('de-DE', { style: 'currency', currency:
+ export const euro = (cents: number) => euroFormat.format(cents / 100);
+ export const toCents = (value: string) => Math.round(Number(value.replace(',', '.')) * 100);
+ 
+-let feedbackAudio: HTMLAudioElement | null = null;
+ export function feedback(kind: 'scan' | 'success' | 'error') {
+   navigator.vibrate?.(kind === 'success' ? [60, 40, 100] : kind === 'error' ? [160, 60, 160] : 60);
+-  feedbackAudio ??= new Audio('/sounds/test-tone.mp3');
+-  feedbackAudio.currentTime = 0;
+-  feedbackAudio.volume = kind === 'error' ? 0.35 : 0.55;
+-  void feedbackAudio.play().catch(() => {});
+ }
+ 
+ // A USB reader types the UID like a keyboard and a phone reports it as a colon-separated string;
+diff --git a/apps/web/src/terminal/nfc.tsx b/apps/web/src/terminal/nfc.tsx
+index a41cf83..de27b4e 100644
+--- a/apps/web/src/terminal/nfc.tsx
++++ b/apps/web/src/terminal/nfc.tsx
+@@ -1,6 +1,6 @@
+ import { useCallback, useEffect, useRef, useState } from 'react';
+ import { AlertTriangle, Keyboard, Loader2, Nfc, ShieldCheck, WifiOff } from 'lucide-react';
+-import { Api, type WalletIdentity } from '@/api';
++import { Api, ApiError,type HistoryEntry, type WalletIdentity } from '@/api';
+ import { Button } from '@/components/ui/button';
+ import { Input } from '@/components/ui/input';
+ import { Label } from '@/components/ui/label';
+@@ -29,13 +29,16 @@ export function useNfcScanner(onScan: (uid: string) => void) {
+     try {
+       const reader = new window.NDEFReader!();
+       await reader.scan({ signal: controller.signal });
++      if(controller.signal.aborted||abortRef.current!==controller)return;
+       reader.onreading = (event: any) => {
++        if(controller.signal.aborted||abortRef.current!==controller)return;
+         const raw = String(event?.serialNumber ?? '');
+         if (raw) onScanRef.current(scannerValue(raw));
+       };
+       reader.onreadingerror = () => { setState('read-error'); setDetail('Das Armband konnte nicht gelesen werden.') };
+       setState('ready');
+     } catch (error) {
++      if(controller.signal.aborted||abortRef.current!==controller)return;
+       const reason = error instanceof Error ? error : new Error(String(error));
+       const denied = reason.name === 'NotAllowedError';
+       setState(denied ? 'denied' : 'read-error');
+@@ -80,7 +83,7 @@ const TONE_CLASS = { ok: 'text-success', warn: 'text-primary', bad: 'text-destru
+  * The single scan surface used by Kasse, Aufladung and Armbandservice. It owns one job: turn a
+  * wristband into a resolved wallet, and make the current state unmistakable while doing it.
+  */
+-export function NfcScanField({ uid, setUid, api, nfc, onResolved, title, hint }: {
++export function NfcScanField({ uid, setUid, api, nfc, onResolved, title, hint,historyMode=false,onHistory }: {
+   uid: string;
+   setUid: (value: string) => void;
+   api: Api;
+@@ -88,35 +91,38 @@ export function NfcScanField({ uid, setUid, api, nfc, onResolved, title, hint }:
+   onResolved: (wallet: WalletIdentity | null) => void;
+   title: string;
+   hint: string;
++  historyMode?:boolean;onHistory?:(result:{wallet:WalletIdentity;entries:HistoryEntry[];truncated?:boolean})=>void;
+ }) {
+   const [resolution, setResolution] = useState<Resolution>({ kind: 'empty' });
+   const [manual, setManual] = useState(false);
+-  const onResolvedRef = useRef(onResolved);
+-  useEffect(() => { onResolvedRef.current = onResolved });
++  const [manualValue,setManualValue]=useState('');
++  const onResolvedRef = useRef(onResolved),onHistoryRef=useRef(onHistory);
++  useEffect(() => { onResolvedRef.current = onResolved;onHistoryRef.current=onHistory });
+ 
+   useEffect(() => {
+     const typed = uid.trim();
+-    if (typed.length < 4) { setResolution({ kind: 'empty' }); onResolvedRef.current(null); return }
++    if (!typed) { setResolution({ kind: 'empty' }); onResolvedRef.current(null); return }
+     let cancelled = false;
+     setResolution({ kind: 'resolving' });
+     const timer = setTimeout(() => {
+-      api.lookupWallet(typed)
+-        .then(wallet => {
+-          if (cancelled) return;
++      (historyMode?api.walletHistory(typed):api.lookupWallet(typed).then(wallet=>({wallet,entries:[],truncated:false})))
++        .then(result => {
++          if (cancelled) return;const {wallet}=result;
++          if(historyMode)onHistoryRef.current?.(result);
+           setResolution({ kind: 'found', wallet });
+           feedback('success');
+           onResolvedRef.current(wallet);
+         })
+         .catch((error: Error) => {
+           if (cancelled) return;
+-          const unknown = /unknown|blocked|not assigned|nicht/i.test(error.message);
++          const unknown = error instanceof ApiError&&error.code==='WRISTBAND_NOT_ACTIVE';
+           setResolution(unknown ? { kind: 'unknown' } : { kind: 'offline', message: error.message });
+           feedback('error');
+           onResolvedRef.current(null);
+         });
+     }, 250);
+     return () => { cancelled = true; clearTimeout(timer) };
+-  }, [uid, api]);
++  }, [uid, api,historyMode]);
+ 
+   const status = STATUS[nfc.state];
+   const showManual = manual || nfc.state === 'unsupported' || nfc.state === 'denied';
+@@ -140,12 +146,12 @@ export function NfcScanField({ uid, setUid, api, nfc, onResolved, title, hint }:
+ 
+       {resolution.kind === 'unknown' && (
+         <p className="flex items-center gap-2 rounded-xl border border-destructive bg-destructive/10 px-4 py-3 text-sm font-semibold text-destructive">
+-          <AlertTriangle className="size-4 shrink-0" />Armband nicht registriert oder gesperrt. Bitte zum Armbandservice.
++          <AlertTriangle className="size-4 shrink-0" />{historyMode?'Armband nicht gefunden. Bitte Nummer kontrollieren.':'Armband nicht registriert oder gesperrt. Bitte zum Armbandservice.'}
+         </p>
+       )}
+       {resolution.kind === 'offline' && (
+         <p className="flex items-center gap-2 rounded-xl border border-destructive bg-destructive/10 px-4 py-3 text-sm font-semibold text-destructive">
+-          <WifiOff className="size-4 shrink-0" />Keine Verbindung zum Kassensystem: {resolution.message}
++          <WifiOff className="size-4 shrink-0" />{resolution.message}
+         </p>
+       )}
+       {resolution.kind === 'found' && (
+@@ -162,7 +168,7 @@ export function NfcScanField({ uid, setUid, api, nfc, onResolved, title, hint }:
+         {showManual && (
+           <div className="flex flex-col gap-2 text-left">
+             <Label htmlFor="band-input">Aufgedruckte Armbandnummer oder UID</Label>
+-            <Input id="band-input" value={uid} onChange={event => setUid(event.target.value)} placeholder="z. B. 10284" autoCapitalize="characters" className="h-14 text-center font-mono text-lg" autoFocus />
++            <form className="flex flex-col gap-2" onSubmit={e=>{e.preventDefault();if(manualValue.trim())setUid(manualValue.trim())}}><Input id="band-input" value={manualValue} onChange={event => setManualValue(event.target.value)} placeholder="z. B. 10284" autoCapitalize="characters" className="h-14 text-center font-mono text-lg" autoFocus /><Button type="submit" className="h-12" disabled={!manualValue.trim()}>Armband auswählen</Button></form>
+           </div>
+         )}
+       </div>
+@@ -171,17 +177,17 @@ export function NfcScanField({ uid, setUid, api, nfc, onResolved, title, hint }:
+ }
+ 
+ /** Compact header shown once a band is bound to the running transaction. */
+-export function BoundBandBar({ wallet, onRelease }: { wallet: WalletIdentity; onRelease: () => void }) {
++export function BoundBandBar({ wallet, onRelease,disabled=false }: { wallet: WalletIdentity; onRelease: () => void;disabled?:boolean }) {
+   return (
+     <div className="sticky top-0 z-20 flex items-center justify-between gap-3 rounded-xl border border-border bg-card px-4 py-3">
+       <div className="min-w-0">
+         <p className="truncate text-xs text-muted-foreground">Armband {wallet.bandNumber}{wallet.uidHex ? ` · ${wallet.uidHex}` : ' · ohne Chip'}</p>
+         <p className="text-3xl font-bold tabular-nums text-primary">{euro(wallet.balanceCents)}</p>
+-        <p className="text-xs text-muted-foreground">Verfügbares Guthaben</p>
++        <p className="text-xs text-muted-foreground">Verfügbares Guthaben</p>{wallet.freeDrinkStatus==='AVAILABLE'&&<p className="font-semibold text-success text-sm">🎁 1 Freigetränk verfügbar</p>}{wallet.freeDrinkStatus==='REDEEMED'&&<p className="text-xs text-muted-foreground">Freigetränk eingelöst</p>}
+       </div>
+       <div className="flex shrink-0 flex-col items-end gap-1">
+         <ShieldCheck className="size-6 text-success" />
+-        <Button variant="ghost" size="sm" onClick={onRelease}>Armband wechseln</Button>
++        <Button variant="outline" size="sm" disabled={disabled} onClick={onRelease}>× Armband abwählen</Button>
+       </div>
+     </div>
+   );
